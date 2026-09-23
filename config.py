@@ -30,6 +30,7 @@ class DolphinSchedulerSettings:
 
 
 class SoloSettings:
+    SHARED_DIR = Path(os.getenv("SOLO_SHARED_DIR", "/shared"))
     WEB_ORIGINS = os.getenv(
         "SOLO_WEB_ORIGINS", "http://127.0.0.1:5174,http://localhost:5174"
     ).split(",")
