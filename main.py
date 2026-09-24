@@ -1,19 +1,25 @@
 """FastAPI entry point."""
 
+from asyncio import to_thread
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from config import DatabaseSettings, DolphinSchedulerSettings, SoloSettings
+from core.apps.projects.views import router as projects_router
+from core.apps.system.views import health
+from core.apps.system.views import router as system_router
+from core.database.session import database_engine
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-from config import DatabaseSettings, SoloSettings
-from core.apps.system.views import health, router as system_router
-from core.database.session import database_engine
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     DatabaseSettings.validate()
+    if DolphinSchedulerSettings.ENABLED:
+        from core.scheduler.workflows import sync_workflows
+
+        application.state.workflows = await to_thread(sync_workflows)
     try:
         yield
     finally:
@@ -29,4 +35,5 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(system_router)
+app.include_router(projects_router)
 app.add_api_route("/health", health, methods=["GET"], tags=["system"])

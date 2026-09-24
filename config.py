@@ -27,10 +27,44 @@ class DatabaseSettings:
 
 class DolphinSchedulerSettings:
     DATABASE = os.getenv("DOLPHINSCHEDULER_DATABASE", "solo_ds")
+    ENABLED = os.getenv("DOLPHINSCHEDULER_ENABLED", "false").lower() == "true"
+    HOST = os.getenv("DOLPHINSCHEDULER_HOST", "127.0.0.1")
+    API_PORT = int(os.getenv("DOLPHINSCHEDULER_API_PORT", "12346"))
+    GATEWAY_PORT = int(os.getenv("DOLPHINSCHEDULER_GATEWAY_PORT", "25334"))
+    BASE_URL = f"http://{HOST}:{API_PORT}/dolphinscheduler"
+    GATEWAY_TOKEN = os.getenv("DOLPHINSCHEDULER_PYTHON_GATEWAY_TOKEN", "")
+    USERNAME = os.getenv("DOLPHINSCHEDULER_USERNAME", "solo-scheduler")
+    PASSWORD = os.getenv("DOLPHINSCHEDULER_PASSWORD", "")
+    PROJECT = "solo-runtime"
+    TENANT = "solo"
+    WORKER_GROUP = "default"
+    RUNTIME_COMMAND = "/opt/solo-runtime/.venv/bin/solo-manage"
+
+    @classmethod
+    def configure_sdk_environment(cls) -> None:
+        if not cls.PASSWORD or not cls.GATEWAY_TOKEN:
+            raise RuntimeError("缺少 DolphinScheduler 密码或 Python Gateway token")
+        os.environ.update({
+            "PYDS_JAVA_GATEWAY_ADDRESS": cls.HOST,
+            "PYDS_JAVA_GATEWAY_PORT": str(cls.GATEWAY_PORT),
+            "PYDS_JAVA_GATEWAY_AUTH_TOKEN": cls.GATEWAY_TOKEN,
+            "PYDS_USER_NAME": cls.USERNAME,
+            "PYDS_USER_PASSWORD": cls.PASSWORD,
+            "PYDS_USER_TENANT": cls.TENANT,
+            "PYDS_WORKFLOW_USER": cls.USERNAME,
+            "PYDS_WORKFLOW_PROJECT": cls.PROJECT,
+            "PYDS_WORKFLOW_WORKER_GROUP": cls.WORKER_GROUP,
+            "PYDS_WORKFLOW_TIME_ZONE": "Asia/Shanghai",
+        })
 
 
 class SoloSettings:
     SHARED_DIR = Path(os.getenv("SOLO_SHARED_DIR", "/shared"))
+    TEMPLATE_REPOSITORY = "Genesis-Quant/solo-algos"
+    SCHEME_REPOSITORY = "Genesis-Quant/solo-algo-scheme"
+    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+    JUPYTER_URL = os.getenv("JUPYTER_URL", "http://127.0.0.1:8888").rstrip("/")
+    JUPYTER_TOKEN = os.getenv("JUPYTER_TOKEN", "")
     WEB_ORIGINS = os.getenv(
         "SOLO_WEB_ORIGINS", "http://127.0.0.1:5174,http://localhost:5174"
     ).split(",")
