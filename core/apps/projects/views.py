@@ -37,12 +37,15 @@ def write_project_metadata(project: Project, directory: Path) -> None:
 
 
 def read_project(project: Project) -> ProjectRead:
+    from .versions import read_version
+
     return ProjectRead(
         id=project.id, name=project.name, description=project.description, kind=project.kind,
         schemeVersion=project.scheme_version, schemeCommit=project.scheme_commit,
         algoVersion=project.template_tag, algoCommit=project.template_commit,
         createdAt=project.created_at, updatedAt=project.updated_at, archived=project.archived,
         directory=f"projects/{project.kind}/{project.name}",
+        versions=[read_version(version) for version in project.versions],
     )
 
 
@@ -73,7 +76,13 @@ def template_versions(kind: ProjectKind, scheme_version: str, refresh: bool = Fa
 
 @router.get("/projects", response_model=list[ProjectRead])
 def list_projects(session: Database) -> list[ProjectRead]:
-    projects = session.scalars(select(Project).where(Project.archived.is_(False)).order_by(Project.updated_at.desc(), Project.id))
+    from .versions import refresh_version
+
+    projects = list(session.scalars(select(Project).where(Project.archived.is_(False)).order_by(Project.updated_at.desc(), Project.id)))
+    for project in projects:
+        for version in project.versions:
+            refresh_version(version)
+    session.commit()
     return [read_project(project) for project in projects]
 
 

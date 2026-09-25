@@ -12,7 +12,9 @@ from urllib3.util.retry import Retry
 
 
 class DolphinSchedulerError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, submission_unknown: bool = False) -> None:
+        super().__init__(message)
+        self.submission_unknown = submission_unknown
 
 
 def validate_input_file(input_file: str) -> str:
@@ -71,7 +73,15 @@ class DolphinSchedulerClient:
         except (requests.RequestException, ValueError) as error:
             # 不输出 URL/body，避免登录密码出现在异常日志。
             raise DolphinSchedulerError(
-                f"DolphinScheduler 请求失败：{method} {path}"
+                f"DolphinScheduler 请求失败：{method} {path}",
+                submission_unknown=(
+                    method == "POST" and path.endswith("/executors/start-process-instance")
+                    and not (
+                        isinstance(error, requests.HTTPError)
+                        and error.response is not None
+                        and 400 <= error.response.status_code < 500
+                    )
+                ),
             ) from error
         if not payload.get("success", payload.get("code") == 0):
             raise DolphinSchedulerError(

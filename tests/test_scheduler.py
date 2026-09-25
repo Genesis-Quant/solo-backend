@@ -25,7 +25,7 @@ def test_reject_unsafe_input(path):
         validate_input_file(path)
 
 
-def test_submit_does_not_retry_post_and_uses_solo_tenant():
+def test_submit_does_not_retry_post_and_uses_root_tenant():
     client = DolphinSchedulerClient()
     client.request = Mock(return_value={"accepted": True})
     client.project_code = Mock(return_value=10)
@@ -34,7 +34,7 @@ def test_submit_does_not_retry_post_and_uses_solo_tenant():
     assert result == {"accepted": True}
     args = client.request.call_args.args
     assert args[0:2] == ("POST", "/projects/10/executors/start-process-instance")
-    assert args[2]["tenantCode"] == "solo"
+    assert args[2]["tenantCode"] == "root"
     assert args[2]["processDefinitionCode"] == 20
     retry = client.session.get_adapter("http://").max_retries
     assert retry.allowed_methods == {"GET"}
@@ -68,4 +68,40 @@ def test_transport_error_does_not_include_secret():
     with pytest.raises(DolphinSchedulerError) as error:
         client.request("POST", "/login", {"userPassword": "secret"})
     assert "secret" not in str(error.value)
+    client.session.close()
+
+
+@pytest.mark.parametrize("path,unknown", [
+    ("/login", False),
+    ("/projects/10/executors/start-process-instance", True),
+])
+def test_transport_failure_identifies_uncertain_submission(path, unknown):
+    client = DolphinSchedulerClient()
+    client.session.request = Mock(side_effect=requests.Timeout())
+    with pytest.raises(DolphinSchedulerError) as error:
+        client.request("POST", path)
+    assert error.value.submission_unknown is unknown
+    client.session.close()
+
+
+@pytest.mark.parametrize("status,unknown", [(403, False), (500, True)])
+def test_submission_http_failure_classification(status, unknown):
+    response = requests.Response()
+    response.status_code = status
+    client = DolphinSchedulerClient()
+    client.session.request = Mock(return_value=response)
+    with pytest.raises(DolphinSchedulerError) as error:
+        client.request("POST", "/projects/10/executors/start-process-instance")
+    assert error.value.submission_unknown is unknown
+    client.session.close()
+
+
+def test_explicit_submission_rejection_is_retryable():
+    client = DolphinSchedulerClient()
+    client.session.request = Mock(return_value=Mock(
+        json=Mock(return_value={"code": 100, "success": False, "msg": "rejected"}),
+    ))
+    with pytest.raises(DolphinSchedulerError) as error:
+        client.request("POST", "/projects/10/executors/start-process-instance")
+    assert error.value.submission_unknown is False
     client.session.close()

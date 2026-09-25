@@ -3,8 +3,20 @@
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, Index, String, UniqueConstraint, Uuid
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from core.database.base import Base
 
@@ -32,3 +44,22 @@ class Project(Base):
     archived: Mapped[bool] = mapped_column(Boolean, default=False, comment="是否已删除隐藏；源码和成果保留")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, comment="创建时间（UTC）")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, comment="更新时间（UTC）")
+    versions: Mapped[list["ProjectVersion"]] = relationship(order_by="ProjectVersion.number.desc()", lazy="selectin")
+
+
+class ProjectVersion(Base):
+    __tablename__ = "project_versions"
+    __table_args__ = (UniqueConstraint("project_id", "number", name="uq_project_version_number"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(ForeignKey("projects.id"), index=True, comment="所属项目")
+    number: Mapped[int] = mapped_column(Integer, comment="项目内递增提交编号")
+    package_version: Mapped[str] = mapped_column(String(128), comment="候选 wheel 的版本")
+    note: Mapped[str] = mapped_column(String(500), default="", comment="版本备注")
+    status: Mapped[str] = mapped_column(String(32), default="building", comment="building/queued/running/success/failed/submit_failed")
+    workflow_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="DolphinScheduler 实例 ID")
+    parameters: Mapped[dict] = mapped_column(JSON, default=dict, comment="冻结的输入参数")
+    scheme_version: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="任务实际 Scheme 版本")
+    error: Mapped[str] = mapped_column(Text, default="", comment="构建或运行错误")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

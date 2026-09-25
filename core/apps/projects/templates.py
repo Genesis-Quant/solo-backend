@@ -1,4 +1,4 @@
-"""读取 GitHub Tag，并从对应 commit 归档复制指定模板目录。"""
+"""读取 Gitee Tag，并从对应 commit 归档复制指定模板目录。"""
 
 from io import BytesIO
 from base64 import b64decode
@@ -6,6 +6,8 @@ from functools import lru_cache
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import subprocess
+from tempfile import TemporaryDirectory
 from threading import Lock
 from time import monotonic
 import tomllib
@@ -29,19 +31,19 @@ _cache: dict[str, tuple[float, list[TemplateVersion]]] = {}
 _lock = Lock()
 
 
-def github_get(path: str, repository: str | None = None) -> requests.Response:
-    headers = {"Accept": "application/vnd.github+json"}
-    if SoloSettings.GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {SoloSettings.GITHUB_TOKEN}"
+def gitee_get(path: str, repository: str | None = None) -> requests.Response:
+    headers = {"Accept": "application/json"}
+    if SoloSettings.GITEE_TOKEN:
+        headers["Authorization"] = f"Bearer {SoloSettings.GITEE_TOKEN}"
     try:
         response = requests.get(
-            f"https://api.github.com/repos/{repository or SoloSettings.TEMPLATE_REPOSITORY}/{path}",
+            f"https://gitee.com/api/v5/repos/{repository or SoloSettings.TEMPLATE_REPOSITORY}/{path}",
             headers=headers, timeout=(10, 45),
         )
         response.raise_for_status()
         return response
     except requests.RequestException as error:
-        raise TemplateError("无法读取 GitHub 模板仓库，请稍后重试或检查网络及 GitHub 访问额度") from error
+        raise TemplateError("无法读取 Gitee 模板仓库，请稍后重试或检查网络及 Gitee 访问额度") from error
 
 
 def version_key(version: TemplateVersion) -> tuple[int, int, int, int, bool, str]:
@@ -59,7 +61,7 @@ def repository_versions(repository: str, refresh: bool = False) -> list[Template
         versions: list[TemplateVersion] = []
         page = 1
         while True:
-            data = github_get(f"tags?per_page=100&page={page}", repository).json()
+            data = gitee_get(f"tags?per_page=100&page={page}", repository).json()
             versions.extend(TemplateVersion(tag=item["name"], commit=item["commit"]["sha"]) for item in data)
             if len(data) < 100:
                 break
@@ -71,7 +73,7 @@ def repository_versions(repository: str, refresh: bool = False) -> list[Template
 
 @lru_cache(maxsize=256)
 def project_metadata(repository: str, commit: str, path: str) -> dict:
-    response = github_get(f"contents/{path}?ref={commit}", repository).json()
+    response = gitee_get(f"contents/{path}?ref={commit}", repository).json()
     return tomllib.loads(b64decode(response["content"]).decode("utf-8"))["project"]
 
 
@@ -117,7 +119,7 @@ def pin_scheme(directory: Path, selected: TemplateVersion) -> None:
         value for value in dependencies if Requirement(value).name.lower() != "scheme"
     ] + [f"scheme>={Version(version).major}.0.0,<{Version(version).major + 1}.0.0"]
     sources = document.setdefault("tool", {}).setdefault("uv", {}).setdefault("sources", {})
-    sources["scheme"] = {"git": f"https://github.com/{SoloSettings.SCHEME_REPOSITORY}", "rev": selected.commit}
+    sources["scheme"] = {"git": f"https://gitee.com/{SoloSettings.SCHEME_REPOSITORY}", "rev": selected.commit}
     path.write_text(tomlkit.dumps(document), encoding="utf-8")
 
 
@@ -142,7 +144,7 @@ def unpack_template(content: bytes, kind: ProjectKind, destination: Path, packag
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(archive.read(member))
     except BadZipFile as error:
-        raise TemplateError("GitHub 返回的模板归档无效") from error
+        raise TemplateError("模板归档无效") from error
     pyproject = destination / "pyproject.toml"
     notebook = destination / "research.ipynb"
     if not pyproject.is_file() or not notebook.is_file():
@@ -150,12 +152,18 @@ def unpack_template(content: bytes, kind: ProjectKind, destination: Path, packag
     data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
     old_package = data["project"]["name"]
     old_module = old_package.replace("-", "_")
-    new_package = f"solo-{kind}-{package_suffix}"
+    new_package = f"{kind}-{package_suffix}"
     new_module = new_package.replace("-", "_")
     # 每个研究项目有独立包名和模块名，可同时安装多个同类成果。
     for file in destination.rglob("*"):
         if file.is_file() and file.suffix in {".py", ".toml", ".ipynb", ".md"}:
-            file.write_text(file.read_text(encoding="utf-8").replace(old_package, new_package).replace(old_module, new_module), encoding="utf-8")
+            text = file.read_text(encoding="utf-8")
+            text = re.sub(rf"\b(from\s+|import\s+){re.escape(old_module)}(?=[.\s,]|$)",
+                          lambda match: match[1] + new_module, text)
+            file.write_text(text, encoding="utf-8")
+    document = tomlkit.parse(pyproject.read_text(encoding="utf-8"))
+    document["project"]["name"] = new_package
+    pyproject.write_text(tomlkit.dumps(document), encoding="utf-8")
     module = destination / "src" / old_module
     if module.is_dir():
         module.rename(module.with_name(new_module))
@@ -163,5 +171,21 @@ def unpack_template(content: bytes, kind: ProjectKind, destination: Path, packag
 
 
 def create_directory(kind: ProjectKind, commit: str, destination: Path, package_suffix: str) -> None:
-    content = github_get(f"zipball/{commit}").content
+    # Gitee 的 zipball API 即便访问公开仓库也要求认证；Git 按 commit 拉取不需要 token。
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise TemplateError("模板 commit 无效")
+    try:
+        with TemporaryDirectory(prefix="solo-template-") as temporary:
+            def git(*arguments: str) -> bytes:
+                return subprocess.run(
+                    ["git", "-C", temporary, *arguments],
+                    check=True, capture_output=True, timeout=120,
+                ).stdout
+
+            git("init", "--bare")
+            git("fetch", "--depth=1", "--no-tags",
+                f"https://gitee.com/{SoloSettings.TEMPLATE_REPOSITORY}.git", commit)
+            content = git("archive", "--format=zip", "--prefix=template/", "FETCH_HEAD", kind)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise TemplateError("无法从 Gitee 获取模板，请检查网络后重试") from error
     unpack_template(content, kind, destination, package_suffix)

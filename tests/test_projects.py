@@ -23,9 +23,9 @@ from main import app
 def archive_content(kind: str, extra: str | None = None) -> bytes:
     result = BytesIO()
     with ZipFile(result, "w") as archive:
-        archive.writestr(f"repo/{kind}/pyproject.toml", f'[project]\nname = "solo-{kind}"\nversion = "0.1.0"\n')
+        archive.writestr(f"repo/{kind}/pyproject.toml", f'[project]\nname = "{kind}"\nversion = "0.1.0"\n')
         archive.writestr(f"repo/{kind}/research.ipynb", '{"cells": [], "metadata": {}}')
-        archive.writestr(f"repo/{kind}/src/solo_{kind}/__init__.py", "")
+        archive.writestr(f"repo/{kind}/src/{kind}/__init__.py", "")
         if extra:
             archive.writestr(extra, "unsafe")
     return result.getvalue()
@@ -36,6 +36,7 @@ def projects_client(tmp_path: Path, monkeypatch):
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(engine)
     monkeypatch.setattr(SoloSettings, "SHARED_DIR", tmp_path)
+    monkeypatch.setattr(SoloSettings, "HOME_DIR", tmp_path / "home")
     monkeypatch.setattr(SoloSettings, "JUPYTER_TOKEN", "")
     monkeypatch.setattr(templates, "list_versions", lambda kind, scheme_version, refresh=False: [TemplateVersion(tag="v0.1.0", commit="a" * 40)])
     monkeypatch.setattr(templates, "list_scheme_versions", lambda refresh=False: [TemplateVersion(tag="v0.1.0", commit="b" * 40)])

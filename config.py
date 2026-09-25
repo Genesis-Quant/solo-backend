@@ -36,7 +36,7 @@ class DolphinSchedulerSettings:
     USERNAME = os.getenv("DOLPHINSCHEDULER_USERNAME", "solo-scheduler")
     PASSWORD = os.getenv("DOLPHINSCHEDULER_PASSWORD", "")
     PROJECT = "solo-runtime"
-    TENANT = "solo"
+    TENANT = "root"
     WORKER_GROUP = "default"
     RUNTIME_COMMAND = "/opt/solo-runtime/.venv/bin/solo-manage"
 
@@ -59,10 +59,11 @@ class DolphinSchedulerSettings:
 
 
 class SoloSettings:
+    HOME_DIR = Path.home()
     SHARED_DIR = Path(os.getenv("SOLO_SHARED_DIR", "/shared"))
-    TEMPLATE_REPOSITORY = "Genesis-Quant/solo-algos"
-    SCHEME_REPOSITORY = "Genesis-Quant/solo-algo-scheme"
-    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+    TEMPLATE_REPOSITORY = "genesis-quant/solo-algos"
+    SCHEME_REPOSITORY = "genesis-quant/solo-algo-scheme"
+    GITEE_TOKEN = os.getenv("GITEE_TOKEN", "")
     JUPYTER_URL = os.getenv("JUPYTER_URL", "http://127.0.0.1:8888").rstrip("/")
     JUPYTER_TOKEN = os.getenv("JUPYTER_TOKEN", "")
     WEB_ORIGINS = os.getenv(

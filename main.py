@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 from config import DatabaseSettings, DolphinSchedulerSettings, SoloSettings
 from core.apps.projects.views import router as projects_router
+from core.apps.projects.versions import router as versions_router
 from core.apps.system.views import health
 from core.apps.system.views import router as system_router
 from core.database.session import database_engine
@@ -36,4 +37,5 @@ app.add_middleware(
 )
 app.include_router(system_router)
 app.include_router(projects_router)
+app.include_router(versions_router)
 app.add_api_route("/health", health, methods=["GET"], tags=["system"])

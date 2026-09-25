@@ -37,4 +37,4 @@ Scheme 版本列表同时返回 Tag、commit 和 `pyproject.toml` 中的实际 `
 
 目录使用 `/shared/projects/model/动量策略`，根目录 `.solo` 保存 `project_id`、`name`、`kind`、`scheme_version`、`scheme_commit`、`algo_version`、`algo_commit`。同类同名项目返回 409；环境安装失败返回 502，并回滚目录；删除不删除源码和环境。
 
-Backend 和 Jupyter 需要挂载相同的 `/shared/projects`。Backend 使用 Git、uv 创建 Python 3.12 环境；Jupyter 设置 `JUPYTER_PATH=/shared/projects/.jupyter` 发现项目 Kernel。模板仓库固定为 `Genesis-Quant/solo-algos`；可通过 `GITHUB_TOKEN` 增加 GitHub API 额度。`JUPYTER_URL` 配置浏览器入口，`JUPYTER_TOKEN` 用于跳转登录，不写入项目文件。
+Backend 和 Jupyter 需要挂载相同的 `/shared/projects`、`/home/jovyan/.python` 和 `/home/jovyan/.jupyter/kernels`，并将 `HOME` 设置为 `/home/jovyan`。Backend 使用 Git、uv 创建 Python 3.12 环境；Jupyter 设置 `JUPYTER_PATH=/home/jovyan/.jupyter` 发现项目 Kernel。模板仓库固定为 `genesis-quant/solo-algos`；可通过 `GITEE_TOKEN` 增加 Gitee API 额度。`JUPYTER_URL` 配置浏览器入口，`JUPYTER_TOKEN` 用于跳转登录，不写入项目文件。

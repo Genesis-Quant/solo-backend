@@ -13,14 +13,14 @@ class EnvironmentError(Exception):
 
 
 def kernel_directory(project_id: str) -> Path:
-    return SoloSettings.SHARED_DIR / "projects" / ".jupyter" / "kernels" / f"solo-{project_id}"
+    return SoloSettings.HOME_DIR / ".jupyter" / "kernels" / f"solo-{project_id}"
 
 
 def prepare_environment(directory: Path, project_id: str, name: str) -> None:
     env = {
         **os.environ,
         "UV_PROJECT_ENVIRONMENT": str(directory / ".venv"),
-        "UV_PYTHON_INSTALL_DIR": str(SoloSettings.SHARED_DIR / "projects" / ".python"),
+        "UV_PYTHON_INSTALL_DIR": str(SoloSettings.HOME_DIR / ".python"),
         "UV_PYTHON_BIN_DIR": "/tmp/solo-python-bin",
         "UV_CACHE_DIR": "/tmp/solo-uv-cache",
         "UV_LINK_MODE": "copy",
@@ -36,7 +36,7 @@ def prepare_environment(directory: Path, project_id: str, name: str) -> None:
     if result.returncode:
         # 只返回 uv 的最后一段错误，避免将父进程环境或认证信息发给浏览器。
         message = result.stderr[-3000:]
-        for secret in (SoloSettings.GITHUB_TOKEN, SoloSettings.JUPYTER_TOKEN):
+        for secret in (SoloSettings.GITEE_TOKEN, SoloSettings.JUPYTER_TOKEN):
             if secret:
                 message = message.replace(secret, "[REDACTED]")
         raise EnvironmentError(f"项目环境安装失败：\n{message}")
