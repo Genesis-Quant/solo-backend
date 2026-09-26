@@ -26,6 +26,7 @@ class DatabaseSettings:
 
 
 class DolphinSchedulerSettings:
+    TIME_ZONE = "Asia/Shanghai"
     DATABASE = os.getenv("DOLPHINSCHEDULER_DATABASE", "solo_ds")
     ENABLED = os.getenv("DOLPHINSCHEDULER_ENABLED", "false").lower() == "true"
     HOST = os.getenv("DOLPHINSCHEDULER_HOST", "127.0.0.1")
@@ -54,7 +55,7 @@ class DolphinSchedulerSettings:
             "PYDS_WORKFLOW_USER": cls.USERNAME,
             "PYDS_WORKFLOW_PROJECT": cls.PROJECT,
             "PYDS_WORKFLOW_WORKER_GROUP": cls.WORKER_GROUP,
-            "PYDS_WORKFLOW_TIME_ZONE": "Asia/Shanghai",
+            "PYDS_WORKFLOW_TIME_ZONE": cls.TIME_ZONE,
         })
 
 

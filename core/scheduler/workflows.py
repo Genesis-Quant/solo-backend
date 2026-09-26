@@ -16,7 +16,7 @@ def sync_workflows() -> dict[str, int]:
     ).create_if_not_exists()
     Project(name=Settings.PROJECT).create_if_not_exists(Settings.USERNAME)
     codes: dict[str, int] = {}
-    for kind in ("factor", "backtest"):
+    for kind in ("factor", "model", "optimize", "control", "execution", "strategy"):
         with Workflow(
             name=kind,
             description=f"Solo {kind} 研究任务",
@@ -29,7 +29,7 @@ def sync_workflows() -> dict[str, int]:
         ) as workflow:
             Shell(
                 name=kind,
-                command=f'exec {Settings.RUNTIME_COMMAND} run --input-file "${{input_file}}"',
+                command=f'exec {Settings.RUNTIME_COMMAND} apps {kind} --input-file "${{input_file}}"',
                 description="读取共享 input.json，在锁定 uv 环境运行，报告写回 /shared/runs",
                 worker_group=Settings.WORKER_GROUP,
                 fail_retry_times=0,

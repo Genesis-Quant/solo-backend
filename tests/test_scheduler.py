@@ -25,6 +25,14 @@ def test_reject_unsafe_input(path):
         validate_input_file(path)
 
 
+def test_reject_backtest_workflow_alias():
+    client = DolphinSchedulerClient()
+    client.request = Mock()
+    with pytest.raises(ValueError, match="未知工作流"):
+        client.definition(1, "backtest")
+    client.request.assert_not_called()
+
+
 def test_submit_does_not_retry_post_and_uses_root_tenant():
     client = DolphinSchedulerClient()
     client.request = Mock(return_value={"accepted": True})

@@ -81,7 +81,7 @@ def list_projects(session: Database) -> list[ProjectRead]:
     projects = list(session.scalars(select(Project).where(Project.archived.is_(False)).order_by(Project.updated_at.desc(), Project.id)))
     for project in projects:
         for version in project.versions:
-            refresh_version(version)
+            refresh_version(version, workflow_kind=project.kind)
     session.commit()
     return [read_project(project) for project in projects]
 
@@ -98,7 +98,15 @@ def create_project(body: ProjectCreate, session: Database) -> ProjectRead:
         version = next((v for v in templates.list_versions(body.kind, body.scheme_version) if v.tag == body.algo_version), None)
         if version is None:
             raise HTTPException(422, "Algo 版本不存在或不兼容所选 scheme，请刷新版本列表")
-        project = Project(id=uuid4(), name=body.name, description=body.description, kind=body.kind,
+        used_suffixes = {identifier.hex[:4] for identifier in session.scalars(
+            select(Project.id).where(Project.kind == body.kind)
+        )}
+        if len(used_suffixes) >= 16 ** 4:
+            raise HTTPException(409, "该项目类型的 4 位包名已用完")
+        project_id = uuid4()
+        while project_id.hex[:4] in used_suffixes:
+            project_id = uuid4()
+        project = Project(id=project_id, name=body.name, description=body.description, kind=body.kind,
                           template_tag=version.tag, template_commit=version.commit,
                           scheme_version=scheme.tag, scheme_commit=scheme.commit)
         if session.scalar(select(Project.id).where(Project.kind == body.kind, Project.name == body.name)):
@@ -108,7 +116,7 @@ def create_project(body: ProjectCreate, session: Database) -> ProjectRead:
             raise HTTPException(409, "同名目录已存在，请使用其他项目名称")
         destination.mkdir(parents=True, exist_ok=False)
         try:
-            templates.create_directory(body.kind, version.commit, destination, project.id.hex)
+            templates.create_directory(body.kind, version.commit, destination, project.id.hex[:4])
             templates.pin_scheme(destination, scheme)
             write_project_metadata(project, destination)
             prepare_environment(destination, str(project.id), project.name)

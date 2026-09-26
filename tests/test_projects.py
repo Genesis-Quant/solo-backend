@@ -2,6 +2,7 @@ from io import BytesIO
 import json
 import tomllib
 from pathlib import Path
+from uuid import UUID
 from zipfile import ZipFile
 
 from fastapi.testclient import TestClient
@@ -79,6 +80,9 @@ def test_create_read_rename_archive(projects_client, kind):
     assert project["algoVersion"] == "v0.1.0"
     assert project["algoCommit"] == "a" * 40
     pyproject = tomllib.loads((directory / "pyproject.toml").read_text(encoding="utf-8"))
+    suffix = project["id"].replace("-", "")[:4]
+    assert pyproject["project"]["name"] == f"{kind}-{suffix}"
+    assert (directory / "src" / f"{kind}_{suffix}" / "__init__.py").is_file()
     assert pyproject["project"]["dependencies"] == ["scheme>=0.0.0,<1.0.0"]
     assert pyproject["tool"]["uv"]["sources"]["scheme"]["rev"] == "b" * 40
     assert len(client.get("/api/v1/projects").json()) == 1
@@ -107,6 +111,23 @@ def test_create_read_rename_archive(projects_client, kind):
 def test_invalid_directory_name(projects_client, name):
     client, _, _ = projects_client
     assert client.post("/api/v1/projects", json={"name": name, "kind": "factor", "scheme_version": "v0.1.0", "algo_version": "v0.1.0"}).status_code == 422
+
+
+def test_short_package_suffix_skips_existing_project(projects_client, monkeypatch):
+    client, root, _ = projects_client
+    identifiers = iter(UUID(value) for value in (
+        "abcd0000-0000-4000-8000-000000000001",
+        "abcd0000-0000-4000-8000-000000000002",
+        "ef120000-0000-4000-8000-000000000003",
+    ))
+    monkeypatch.setattr(views, "uuid4", lambda: next(identifiers))
+    for name, suffix in (("first", "abcd"), ("second", "ef12")):
+        response = client.post("/api/v1/projects", json={
+            "name": name, "kind": "factor", "scheme_version": "v0.1.0", "algo_version": "v0.1.0",
+        })
+        assert response.status_code == 201, response.text
+        data = tomllib.loads((root / "projects" / "factor" / name / "pyproject.toml").read_text())
+        assert data["project"]["name"] == f"factor-{suffix}"
 
 
 def test_missing_tag_and_download_failure(projects_client, monkeypatch):

@@ -96,7 +96,7 @@ class DolphinSchedulerClient:
         raise DolphinSchedulerError(f"项目 {Settings.PROJECT} 尚未初始化")
 
     def definition(self, project: int, kind: str) -> dict[str, Any]:
-        if kind not in {"factor", "backtest"}:
+        if kind not in {"factor", "model", "optimize", "control", "execution", "strategy"}:
             raise ValueError(f"未知工作流：{kind}")
         result = self.request(
             "GET",
@@ -165,3 +165,83 @@ class DolphinSchedulerClient:
         # 3.2.2 的空日志页也可能返回 lineNum=1。
         lines = int(result.get("lineNum", 0)) if message else 0
         return {"message": message, "next_offset": offset + lines}
+
+    def task_log(
+        self,
+        *,
+        task_instance_id: int,
+        skip_line_num: int = 0,
+        limit: int = 1000,
+    ) -> dict[str, Any]:
+        """Read a page of a task log and return the next line cursor."""
+        result = self.task_log_detail(task_instance_id, skip_line_num, limit)
+        if isinstance(result, dict):
+            message = str(result.get("message", ""))
+            # DolphinScheduler 3.2.2 reports lineNum=1 even when a request past
+            # the end of the log returns an empty message. An empty page must
+            # not advance the cursor or polling will invent one line per tick.
+            returned_lines = int(result.get("lineNum", 0)) if message else 0
+            next_line_num = skip_line_num + returned_lines
+            return {
+                "skip_line_num": skip_line_num,
+                "returned_lines": returned_lines,
+                "next_line_num": next_line_num,
+                "has_more": bool(
+                    message
+                    and self.task_log_message(
+                        self.task_log_detail(task_instance_id, next_line_num, 1)
+                    )
+                ),
+                "message": message,
+            }
+        message = str(result or "")
+        returned_lines = len(message.splitlines())
+        next_line_num = skip_line_num + returned_lines
+        return {
+            "skip_line_num": skip_line_num,
+            "returned_lines": returned_lines,
+            "next_line_num": next_line_num,
+            "has_more": bool(
+                message
+                and self.task_log_message(
+                    self.task_log_detail(task_instance_id, next_line_num, 1)
+                )
+            ),
+            "message": message,
+        }
+
+    def task_log_detail(
+        self,
+        task_instance_id: int,
+        skip_line_num: int,
+        limit: int,
+    ) -> Any:
+        return self.request(
+            "GET",
+            "/log/detail",
+            params={
+                "taskInstanceId": task_instance_id,
+                "skipLineNum": skip_line_num,
+                "limit": limit,
+            },
+        )
+
+    @staticmethod
+    def task_log_message(result: Any) -> str:
+        if isinstance(result, dict):
+            return str(result.get("message", ""))
+        return str(result or "")
+
+    def download_log(self, task_id: int) -> str:
+        project = self.project_code()
+        try:
+            with self.session.get(
+                f"{Settings.BASE_URL}/log/{project}/download-log",
+                params={"taskInstanceId": task_id}, timeout=self.timeout,
+            ) as response:
+                response.raise_for_status()
+                if "json" in response.headers.get("Content-Type", "").lower():
+                    raise DolphinSchedulerError("DolphinScheduler 日志下载失败")
+                return response.content.decode("utf-8", errors="replace")
+        except requests.RequestException as error:
+            raise DolphinSchedulerError("DolphinScheduler 日志下载失败") from error

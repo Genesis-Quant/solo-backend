@@ -12,10 +12,10 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("sync")
     start = commands.add_parser("start")
-    start.add_argument("kind", choices=["factor", "backtest"])
+    start.add_argument("kind", choices=["factor", "model", "optimize", "control", "execution", "strategy"])
     start.add_argument("--input-file", required=True)
     instances = commands.add_parser("instances")
-    instances.add_argument("kind", choices=["factor", "backtest"])
+    instances.add_argument("kind", choices=["factor", "model", "optimize", "control", "execution", "strategy"])
     for name in ("instance", "tasks", "log"):
         command = commands.add_parser(name)
         command.add_argument("id", type=int)
