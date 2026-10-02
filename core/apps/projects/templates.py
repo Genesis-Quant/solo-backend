@@ -1,25 +1,25 @@
 """读取 Gitee Tag，并从对应 commit 归档复制指定模板目录。"""
 
-from io import BytesIO
-from base64 import b64decode
-from functools import lru_cache
-from pathlib import Path, PurePosixPath
 import re
 import stat
 import subprocess
+import tomllib
+from base64 import b64decode
+from functools import lru_cache
+from io import BytesIO
+from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 from threading import Lock
 from time import monotonic
-import tomllib
 from zipfile import BadZipFile, ZipFile
 
 import requests
 import tomlkit
 from packaging.requirements import Requirement
-from packaging.specifiers import SpecifierSet
-from packaging.version import Version, InvalidVersion
+from packaging.version import Version
 
 from config import SoloSettings
+
 from .schemas import ProjectKind, TemplateVersion
 
 
@@ -90,6 +90,29 @@ def select_scheme(tag: str) -> TemplateVersion:
     return selected
 
 
+def validate_template(project: dict, scheme: Version) -> None:
+    """模板保留同主版本的最低正式版本下界，并兼容实际选定的 Scheme。"""
+    if Version(project.get("version", "")).major != scheme.major:
+        raise ValueError("模板主版本必须与 scheme 一致")
+    requirements = [(text, Requirement(text)) for text in project.get("dependencies", [])]
+    scheme_requirements = [(text, r) for text, r in requirements if r.name.lower() == "scheme"]
+    message = f"模板必须声明兼容 scheme 的唯一范围：>=X.Y.Z,<{scheme.major + 1}.0.0（X={scheme.major}，无 URL、marker、extras）"
+    if len(scheme_requirements) != 1:
+        raise ValueError(message)
+    text, requirement = scheme_requirements[0]
+    bounds = {specifier.operator: specifier.version for specifier in requirement.specifier}
+    minimum = bounds.get(">=", "")
+    # SpecifierSet 会去重；原始声明也只能包含两个边界。
+    if (requirement.url or requirement.marker or requirement.extras or text.count(",") != 1
+            or len(requirement.specifier) != 2 or set(bounds) != {">=", "<"}
+            or not all(re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,2}", value) for value in bounds.values())
+            or Version(minimum).major != scheme.major
+            or Version(bounds["<"]) != Version(f"{scheme.major + 1}.0.0")):
+        raise ValueError(message)
+    if scheme not in requirement.specifier:
+        raise ValueError(f"所选 scheme {scheme} 不满足模板依赖：{requirement}")
+
+
 def list_versions(kind: ProjectKind, scheme_version: str, refresh: bool = False) -> list[TemplateVersion]:
     selected = select_scheme(scheme_version)
     scheme = Version(project_metadata(SoloSettings.SCHEME_REPOSITORY, selected.commit, "pyproject.toml")["version"])
@@ -97,27 +120,19 @@ def list_versions(kind: ProjectKind, scheme_version: str, refresh: bool = False)
     for release in repository_versions(SoloSettings.TEMPLATE_REPOSITORY, refresh):
         project = project_metadata(SoloSettings.TEMPLATE_REPOSITORY, release.commit, f"{kind}/pyproject.toml")
         try:
-            if Version(project["version"]).major != scheme.major:
-                continue
-        except InvalidVersion:
+            validate_template(project, scheme)
+        except ValueError:
             continue
-        requirements = [Requirement(value) for value in project.get("dependencies", [])]
-        required = SpecifierSet(f">={scheme.major}.0.0,<{scheme.major + 1}.0.0")
-        scheme_requirements = [r for r in requirements if r.name.lower() == "scheme"]
-        if len(scheme_requirements) == 1 and not scheme_requirements[0].url and not scheme_requirements[0].marker and scheme_requirements[0].specifier == required:
-            result.append(release)
+        result.append(release)
     return result
 
 
 def pin_scheme(directory: Path, selected: TemplateVersion) -> None:
-    """wheel 声明整个大版本范围；uv source/lock 固定项目实际使用的 commit。"""
-    version = project_metadata(SoloSettings.SCHEME_REPOSITORY, selected.commit, "pyproject.toml")["version"]
+    """保留模板依赖范围；验证兼容后仅用 uv source 固定实际 commit。"""
+    version = Version(project_metadata(SoloSettings.SCHEME_REPOSITORY, selected.commit, "pyproject.toml")["version"])
     path = directory / "pyproject.toml"
     document = tomlkit.parse(path.read_text(encoding="utf-8"))
-    dependencies = document["project"].get("dependencies", [])
-    document["project"]["dependencies"] = [
-        value for value in dependencies if Requirement(value).name.lower() != "scheme"
-    ] + [f"scheme>={Version(version).major}.0.0,<{Version(version).major + 1}.0.0"]
+    validate_template(document["project"], version)
     sources = document.setdefault("tool", {}).setdefault("uv", {}).setdefault("sources", {})
     sources["scheme"] = {"git": f"https://gitee.com/{SoloSettings.SCHEME_REPOSITORY}", "rev": selected.commit}
     path.write_text(tomlkit.dumps(document), encoding="utf-8")

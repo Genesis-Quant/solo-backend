@@ -31,7 +31,7 @@ Docker Compose 由上一级 Solo 工作区维护。`alembic upgrade head` 在 `s
 | `GET/PATCH/DELETE /api/v1/projects/{id}` | 项目详情 / 修改 / 删除隐藏 |
 | `GET /api/v1/projects/{id}/jupyter` | 跳转项目 Notebook |
 
-创建时先选择 Scheme 版本，再选择同主版本的 Algo。模板必须声明整个大版本范围，例如 `scheme>=1.0.0,<2.0.0`；精确版本、缩窄范围和直接 Git 依赖不符合发布契约。创建请求示例：`{"name":"动量策略","description":"","kind":"model","scheme_version":"v1.0.0","algo_version":"v1.2.0"}`。项目 `dependencies` 保留大版本范围，`tool.uv.sources.scheme` 固定选定 commit，`uv.lock` 锁定实际环境；构建 wheel 不携带项目的 uv source 覆盖。
+创建时先选择 Scheme 版本，再选择同主版本且依赖范围包含所选 Scheme 实际版本的 Algo。模板必须声明唯一的 Scheme 依赖，范围为最低正式版本 `>=X.Y.Z` 与唯一下一个主版本上界 `<(X+1).0.0`（继续接受 `>=1,<2`、`>=1.1,<2` 等 PEP 440 等价简写）。例如旧 `scheme>=1.0.0,<2.0.0` 仍有效；1.1.0 模板声明 `scheme>=1.1.0,<2.0.0`，拒绝 Scheme 1.0.1，允许 1.1.0。URL/Git 依赖、marker、extras、多条 Scheme 依赖、精确版本、跨主版本、缺少上界及 `!=`/`~=` 等复杂声明均不符合发布契约。创建请求示例：`{"name":"动量策略","description":"","kind":"model","scheme_version":"v1.1.0","algo_version":"v1.1.0"}`。项目 `dependencies` 保留模板原始范围（不降低最低版本），仅在兼容校验通过后将 `tool.uv.sources.scheme` 固定为选定 commit，`uv.lock` 锁定实际环境；构建 wheel 不携带项目的 uv source 覆盖，正式执行还会校验实际安装的 Scheme 在 wheel 声明范围内。不自动修改已有研究项目或环境。
 
 Scheme 版本列表同时返回 Tag、commit 和 `pyproject.toml` 中的实际 `version`，前端根据实际版本判断是否支持。
 
