@@ -152,15 +152,7 @@ class DolphinSchedulerClient:
         return result.get("taskList") or []
 
     def log(self, task_id: int, offset: int = 0, limit: int = 1000) -> dict[str, Any]:
-        result = self.request(
-            "GET",
-            "/log/detail",
-            {
-                "taskInstanceId": task_id,
-                "skipLineNum": offset,
-                "limit": limit,
-            },
-        )
+        result = self.task_log_detail(task_id, offset, limit)
         message = result.get("message", "")
         # 3.2.2 的空日志页也可能返回 lineNum=1。
         lines = int(result.get("lineNum", 0)) if message else 0

@@ -13,6 +13,8 @@ uv run uvicorn main:app --host 127.0.0.1 --port 8010 --reload
 
 健康检查：`/health`、`/api/v1/health`；接口文档：`/docs`。
 
+任务日志分页和下载仅通过 DolphinScheduler HTTP API 获取。Backend 不挂载或读取调度器日志文件；调度器无法获取日志时，接口返回 502 和调度器错误，不伪装成 Backend 断连或空日志。
+
 ```powershell
 uv run pytest
 ```

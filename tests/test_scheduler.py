@@ -113,3 +113,64 @@ def test_explicit_submission_rejection_is_retryable():
         client.request("POST", "/projects/10/executors/start-process-instance")
     assert error.value.submission_unknown is False
     client.session.close()
+
+
+def test_log_failure_is_reported_and_next_request_uses_api_again():
+    client = DolphinSchedulerClient()
+    error = DolphinSchedulerError("Worker 地址不可达")
+    client.request = Mock(side_effect=[error, {"message": "", "lineNum": 1}])
+    try:
+        with pytest.raises(DolphinSchedulerError) as caught:
+            client.task_log(task_instance_id=42, skip_line_num=20, limit=5)
+        assert caught.value is error
+        assert client.log(42, offset=20, limit=5) == {"message": "", "next_offset": 20}
+        assert client.request.call_count == 2
+        client.request.assert_called_with("GET", "/log/detail", params={
+            "taskInstanceId": 42, "skipLineNum": 20, "limit": 5,
+        })
+    finally:
+        client.session.close()
+
+
+@pytest.mark.parametrize("body,content_type,status,expected", [
+    ("日志\n\n".encode(), "application/octet-stream", 200, "日志\n\n"),
+    (b"log\xff\n", "text/plain", 200, "log\ufffd\n"),
+    (b'{"code":100,"msg":"worker unavailable"}', "application/json", 200, None),
+    (b'{"detail":"worker unavailable"}', "application/problem+json", 200, None),
+    (b"forbidden", "text/html", 403, None),
+    (b"upstream error", "text/plain", 502, None),
+])
+def test_download_uses_api_response_or_reports_failure(body, content_type, status, expected):
+    response = requests.Response()
+    response.status_code = status
+    response.headers["Content-Type"] = content_type
+    response._content = body
+    response._content_consumed = True
+    client = DolphinSchedulerClient()
+    client.project_code = Mock(return_value=10)
+    client.session.get = Mock(return_value=response)
+    try:
+        if expected is None:
+            with pytest.raises(DolphinSchedulerError, match="日志下载失败"):
+                client.download_log(42)
+        else:
+            assert client.download_log(42) == expected
+        assert client.session.get.call_args.args[0].endswith("/log/10/download-log")
+        assert client.session.get.call_args.kwargs == {
+            "params": {"taskInstanceId": 42}, "timeout": client.timeout,
+        }
+    finally:
+        client.session.close()
+
+
+@pytest.mark.parametrize("error", [requests.Timeout("secret"), requests.ConnectionError("secret")])
+def test_log_download_transport_error_is_not_file_fallback(error):
+    client = DolphinSchedulerClient()
+    client.project_code = Mock(return_value=10)
+    client.session.get = Mock(side_effect=error)
+    try:
+        with pytest.raises(DolphinSchedulerError) as caught:
+            client.download_log(42)
+        assert str(caught.value) == "DolphinScheduler 日志下载失败"
+    finally:
+        client.session.close()

@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 from core.apps.projects import versions
-from core.scheduler.client import DolphinSchedulerClient
+from core.scheduler.client import DolphinSchedulerClient, DolphinSchedulerError
 from core.scheduler.task_logs import append_worker_output_lines, raw_log_lines, worker_task_log_page
 
 
@@ -232,6 +232,25 @@ def test_version_download_returns_complete_log(log_version):
     message = "line\n" * 10001
     client.download_log.return_value = message
     assert versions.download_version_log(version.project_id, version.id, 42, session) == message
+
+
+@pytest.mark.parametrize("scope", ["full", "worker"])
+def test_version_log_api_failure_is_returned_as_bad_gateway(log_version, scope):
+    version, session, client = log_version
+    client.task_log.side_effect = DolphinSchedulerError("Worker 地址不可达")
+    with pytest.raises(HTTPException) as caught:
+        versions.version_logs(version.project_id, version.id, session, 42, scope=scope)
+    assert caught.value.status_code == 502
+    assert caught.value.detail == "Worker 地址不可达"
+
+
+def test_version_log_download_failure_is_returned_as_bad_gateway(log_version):
+    version, session, client = log_version
+    client.download_log.side_effect = DolphinSchedulerError("DolphinScheduler 日志下载失败")
+    with pytest.raises(HTTPException) as caught:
+        versions.download_version_log(version.project_id, version.id, 42, session)
+    assert caught.value.status_code == 502
+    assert caught.value.detail == "DolphinScheduler 日志下载失败"
 
 
 def test_empty_scheduler_page_keeps_offset():
