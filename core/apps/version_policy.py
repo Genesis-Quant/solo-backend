@@ -3,16 +3,19 @@
 import hashlib
 import json
 import re
+import tomllib
 from email.parser import BytesParser
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
+from urllib.request import url2pathname
 from uuid import UUID
 from zipfile import BadZipFile, ZipFile
 
-import tomllib
-from config import BACKEND_ROOT, SoloSettings
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 from sqlalchemy import select
+
+from config import BACKEND_ROOT, SoloSettings
 
 POLICY_FILE = BACKEND_ROOT / "version-policy.json"
 RESEARCH_PACKAGE = re.compile(r"(factor|model|optimize|control|execution)-([0-9a-f]{4})")
@@ -75,7 +78,11 @@ def require_release(kind: str, **source) -> None:
 def project_sources(project) -> dict:
     return {
         "scheme": {"tag": project.scheme_version, "commit": project.scheme_commit},
-        "template": {"tag": project.template_tag, "commit": project.template_commit},
+        # New projects retain verified creation metadata, never the mutable
+        # candidate counter in workspace pyproject.toml. Legacy semver tags keep
+        # release_reason's documented fallback; unknown custom tags fail closed.
+        "template": {"tag": project.template_tag, "commit": project.template_commit,
+                     "version": getattr(project, "template_package_version", None)},
     }
 
 
@@ -84,7 +91,12 @@ def source_reason(sources: dict) -> str | None:
         source = sources.get(kind, {})
         if not source or not (source.get("tag") or source.get("commit") or source.get("version")):
             raise VersionPolicyError(f"缺少 {kind} release 来源；仅允许读取历史", "invalid_version_source")
-        reason = release_reason(kind, **source)
+        release = retired_release(kind, source.get("tag"), source.get("commit"))
+        if release:
+            return release["reason"]
+        # Scheme metadata comes from the applicable frozen lock, not tag digits.
+        reason = (release_reason(kind, version=source.get("version")) if kind == "scheme"
+                  else release_reason(kind, **source))
         if reason:
             return reason
         if kind == "template" and source and not (
@@ -199,6 +211,50 @@ def file_in_run(directory: Path, value: str) -> Path:
     return path
 
 
+def local_lock_path(base: Path, value: str) -> Path:
+    """Decode only filesystem/file URLs; never turn a remote index into a local path."""
+    if not isinstance(value, str) or not value:
+        raise ValueError("锁文件缺少本地 wheel 来源")
+    if Path(value).is_absolute():
+        return Path(value).resolve()
+    location = urlsplit(value)
+    if location.query or location.fragment or location.netloc or location.scheme not in {"", "file"}:
+        raise ValueError("锁文件 wheel 来源必须是本地文件，不能使用远端 registry")
+    path = Path(url2pathname(location.path) if location.scheme == "file" else unquote(location.path))
+    return (base / path).resolve()
+
+
+def locked_local_wheel(directory: Path, lockfile: Path, package: dict) -> Path:
+    """Resolve the exact artifact declared by uv, not another wheel in the index."""
+    source = package.get("source", {})
+    if set(source) == {"path"}:
+        return file_in_run(directory, str(local_lock_path(lockfile.parent, source["path"])))
+    if set(source) != {"registry"}:
+        raise ValueError(f"研究依赖 {package['name']} 缺少冻结本地 wheel 来源")
+    registry = local_lock_path(lockfile.parent, source["registry"])
+    if not registry.is_relative_to(directory.resolve()) or not registry.is_dir():
+        raise ValueError("任务本地 registry 必须位于对应 runs/{id} 中")
+    wheels = package.get("wheels", [])
+    if len(wheels) != 1:
+        raise ValueError("本地 registry 必须锁定唯一准确 wheel，不能扫描或回退其他候选")
+    wheel, = wheels
+    if ("path" in wheel) == ("url" in wheel):
+        raise ValueError("本地 registry wheel 必须声明唯一 path 或 URL")
+    path = local_lock_path(registry if "path" in wheel else lockfile.parent, wheel.get("path", wheel.get("url")))
+    path = file_in_run(directory, str(path))
+    if not path.is_relative_to(registry) or path.suffix != ".whl":
+        raise ValueError("锁定 wheel 必须位于其本地 registry 中")
+    # uv omits hashes for local wheels.path; when a lock provides a digest it is
+    # binding. METADATA/series/entry and database source checks still always run.
+    if "hash" in wheel:
+        digest = wheel["hash"]
+        if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            raise ValueError("锁定 wheel 必须使用有效 sha256")
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest.removeprefix("sha256:"):
+            raise ValueError("锁定 wheel sha256 不一致")
+    return path
+
+
 def validate_wheel(directory: Path, component: dict, *, package: str, version: str, scheme: Version) -> None:
     require_result_series(version, scheme)
     if canonicalize_name(component["package"]) != package or component["version"] != version:
@@ -281,28 +337,23 @@ def task_source_reasons(session, record, project, lock: dict, directory: Path, d
             # Installed-but-unsaved upstream wheels still bind to an active real
             # project; saved results above never borrow its current workspace lock.
             require_project(root)
+        wheel = locked_local_wheel(directory, directory / data["environment"]["lockfile"], packages[name])
         if name in components:
-            location = packages[name].get("source", {}).get("path")
-            if not location:
-                raise ValueError(f"研究组件 {name} 未锁定本地 wheel")
-            path = file_in_run(directory, str((directory / data["environment"]["lockfile"]).parent / location))
-            if path != file_in_run(directory, components[name]["wheel"]):
+            if wheel != file_in_run(directory, components[name]["wheel"]):
                 raise ValueError("输入组件 wheel 与锁文件安装来源不一致")
             validate_wheel(directory, components[name], package=name, version=packages[name]["version"], scheme=actual)
         else:
-            location = packages[name].get("source", {}).get("path")
-            if not location:
-                raise ValueError(f"研究依赖 {name} 缺少冻结本地 wheel 来源")
-            wheel = file_in_run(directory, str((directory / data["environment"]["lockfile"]).parent / location))
             kind = root.kind
             symbol = "Factor" if kind == "factor" else f"{kind.title()}Algo"
             validate_wheel(directory, {"package": name, "version": packages[name]["version"],
                 "wheel": str(wheel), "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
                 "entry": f"{name.replace('-', '_')}:{symbol}"}, package=name, version=packages[name]["version"], scheme=actual)
     for package in packages.values():
-        path = package.get("source", {}).get("path")
-        if path:
-            file_in_run(directory, str((directory / data["environment"]["lockfile"]).parent / path))
+        source = package.get("source", {})
+        if "path" in source:
+            file_in_run(directory, str(local_lock_path((directory / data["environment"]["lockfile"]).parent, source["path"])))
+        elif "registry" in source and urlsplit(source["registry"]).scheme in {"", "file"}:
+            locked_local_wheel(directory, directory / data["environment"]["lockfile"], package)
     return reasons
 
 

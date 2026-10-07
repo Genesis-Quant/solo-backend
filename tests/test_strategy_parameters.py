@@ -97,7 +97,7 @@ def test_projection_preserves_runtime_defaults(selected_form):
             return self
 
     result = inspect({**selected_form("model", Params, Form), "values": {}})
-    assert result == {"backtest": {}, "params": {"window": 20}}
+    assert result == {"backtest": {}, "params": {"window": 20}, "common": {}}
 
 
 @pytest.mark.parametrize("canonical", [False, True])
@@ -276,7 +276,10 @@ def test_legacy_frozen_form_alias_round_trips_defaults_saved_and_submit(selected
     restored = inspect({**data, "saved": {"window": 17, "lookback_days": 99, "other": 5}})
     assert restored["values"] == {"lookback_days": 17}
     result = inspect({**data, "values": restored["values"]})
-    assert result == {"backtest": {"window": 17}, "params": {"window": 17}}
+    assert result == {
+        "backtest": {"window": 17}, "params": {"window": 17},
+        **({"common": {}} if kind == "model" else {}),
+    }
     with pytest.raises(ValueError, match="未声明字段.*window"):
         inspect({**data, "values": {"window": 17}})
     with pytest.raises(ValidationError, match="lookback_days"):
@@ -338,7 +341,7 @@ def test_standalone_script_round_trips_frozen_form_with_only_legacy_scheme_api()
     assert submitted.returncode == 0, submitted.stderr
     assert json.loads(submitted.stdout) == {
         "backtest": {"window": 17, "study": "not a runtime field"},
-        "params": {"window": 17},
+        "params": {"window": 17}, "common": {},
     }
     rejected = execute({**data, "values": {"window": 17}})
     assert rejected.returncode == 1
@@ -526,3 +529,119 @@ def test_builtin_default_parameters_keep_legacy_discovery(monkeypatch):
     assert inspect({"kind": "optimize", "values": {"gross_exposure": 0.75}}) == {
         "params": {"gross_exposure": 0.75},
     }
+
+
+@pytest.mark.parametrize("outer_alias", [False, True])
+@pytest.mark.parametrize("nested_alias", [False, True])
+def test_nested_form_alias_scopes_round_trip_schema_defaults_and_submission(
+    selected_form, outer_alias, nested_alias,
+):
+    class Nested(BaseModel):
+        model_config = ConfigDict(validate_by_alias=nested_alias, extra="forbid")
+        count: int = Field(
+            validation_alias=AliasChoices("n_select", "legacy_count"),
+            serialization_alias="reported_count", gt=0,
+        )
+
+    nested_key = "n_select" if nested_alias else "count"
+
+    class Params(BaseModel):
+        counts: list[int]
+
+    class Form(BaseModel):
+        model_config = ConfigDict(validate_by_alias=outer_alias, extra="forbid")
+        nested: Nested = Field(alias="selection")
+        optional: Nested | None = Field(
+            default=Nested(**{nested_key: 7}), alias="optional_selection",
+        )
+        items: list[Nested] = Field(
+            default_factory=lambda: [Nested(**{nested_key: 11})], alias="selections",
+        )
+        empty: Nested | None = Field(default=None, alias="empty_selection")
+
+        def build(self):
+            return Params(counts=[
+                self.nested.count, self.optional.count, *(item.count for item in self.items),
+            ])
+
+    data = selected_form("optimize", Params, Form)
+    definition = inspect(data)
+    schema = definition["schema"]
+    nested_schema = schema["$defs"]["Nested"]
+    assert set(nested_schema["properties"]) == {nested_key}
+    assert nested_schema["required"] == [nested_key]
+    keys = {
+        "nested": "selection", "optional": "optional_selection",
+        "items": "selections", "empty": "empty_selection",
+    } if outer_alias else {name: name for name in Form.model_fields}
+    assert set(schema["properties"]) == set(keys.values())
+    assert schema["required"] == [keys["nested"]]
+    assert schema["properties"][keys["optional"]]["default"] == {nested_key: 7}
+    assert schema["properties"][keys["nested"]]["$ref"] == "#/$defs/Nested"
+    assert schema["properties"][keys["items"]]["items"]["$ref"] == "#/$defs/Nested"
+    assert definition["values"] == {
+        keys["optional"]: {nested_key: 7}, keys["items"]: [{nested_key: 11}],
+        keys["empty"]: None,
+    }
+    values = {**definition["values"], keys["nested"]: {nested_key: 17}}
+    assert inspect({**data, "values": values})["params"] == {"counts": [17, 7, 11]}
+    restored = inspect({**data, "saved": {
+        "optional": {"count": 23}, "items": [{"count": 19}],
+    }})
+    assert restored["values"][keys["optional"]] == {nested_key: 23}
+    assert restored["values"][keys["items"]] == [{nested_key: 19}]
+    assert inspect({
+        **data, "values": {**restored["values"], keys["nested"]: {nested_key: 17}},
+    })["params"] == {"counts": [17, 23, 19]}
+    with pytest.raises(ValidationError, match=nested_key):
+        inspect({**data, "values": {**values, keys["nested"]: {}}})
+    with pytest.raises(ValidationError):
+        inspect({**data, "values": {
+            **values, keys["nested"]: {"count" if nested_alias else "n_select": 17},
+        }})
+    with pytest.raises(ValidationError, match="undeclared"):
+        inspect({**data, "values": {
+            **values, keys["nested"]: {nested_key: 17, "undeclared": 99},
+        }})
+
+
+@pytest.mark.parametrize("extra", ["start", "cash", "unknown", "config"])
+def test_model_common_snapshot_uses_only_validated_declared_canonical_fields(selected_form, extra):
+    class Params(BaseModel):
+        model_config = ConfigDict(extra="allow", serialize_by_alias=True)
+        window: int = Field(validation_alias="runtime_days", serialization_alias="saved_days")
+
+    class Analysis(Params):
+        study: str = "research only"
+
+    built = []
+
+    class Form(BaseModel):
+        model_config = ConfigDict(extra="allow", frozen=True)
+        start: date = Field(validation_alias=AliasChoices("start_on", "legacy_start"))
+        end: date = Field(alias="end_on")
+        pool: str = Field(default="沪深 300", alias="stock_pool")
+        lookback: timedelta = Field(default=timedelta(days=5), alias="history")
+        cash: float = Field(default=1_000_000, alias="initial_cash", gt=0, exclude=True)
+        window: int = Field(default=20, alias="market_data")
+        optimize: str = Field(default="default:optimize", alias="selected_optimize")
+
+        def build(self):
+            analysis = Analysis(runtime_days=self.window, unrelated="must not leak")
+            built.append(analysis)
+            return analysis
+
+    data = selected_form("model", Params, Form)
+    values = {"start_on": "2026-06-01", "end_on": "2026-06-03", "initial_cash": "123000"}
+    result = inspect({**data, "values": values})
+    assert result["common"] == {
+        "start": "2026-06-01", "end": "2026-06-03", "pool": "沪深 300",
+        "lookback": "P5D", "cash": 123_000,
+    }
+    assert result["params"] == {"window": 20}
+    assert built[0].model_extra == {"unrelated": "must not leak"}
+    assert "window" in result["backtest"] and "saved_days" not in result["backtest"]
+    with pytest.raises(ValueError, match=f"未声明字段.*{extra}"):
+        inspect({**data, "values": {**values, extra: "must not leak"}})
+    with pytest.raises(ValidationError, match="initial_cash"):
+        inspect({**data, "values": {**values, "initial_cash": 0}})

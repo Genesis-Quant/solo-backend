@@ -10,11 +10,12 @@ from uuid import uuid4
 from zipfile import ZipFile
 
 import pytest
+from fastapi import HTTPException
+
 from config import SoloSettings
 from core.apps.projects import versions
 from core.apps.projects.models import ProjectVersion
 from core.scheduler.client import DolphinSchedulerError
-from fastapi import HTTPException
 
 
 @pytest.fixture
@@ -112,6 +113,77 @@ def test_cancel_orphan_build_ignores_late_completion(submission):
     assert "取消" in version.error
     session.commit.assert_called_once()
     assert submit(version, session)["phase"] == "failed"
+    factory.assert_not_called()
+
+
+@pytest.mark.parametrize("status", ["building", "submit_failed"])
+@pytest.mark.parametrize("source", ["scheme", "template", "unknown"])
+def test_failed_build_callback_records_failure_without_release_admission(submission, status, source):
+    version, session, factory, _, directory = submission
+    version.status = status
+    project = session.get.return_value
+    if source == "scheme":
+        project.scheme_version = "v1.1.0"
+    elif source == "template":
+        project.template_tag = "v1.0.1"
+    else:
+        project.template_tag = "custom-unknown"
+    before = {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
+    result = versions.submit_version(
+        version.project_id, version.id, versions.BuildResult(error="后台准入检查失败，未执行构建"), session,
+    )
+    assert result["phase"] == "failed"
+    assert result["error"] == "后台准入检查失败，未执行构建"
+    assert version.finished_at is not None
+    assert version.input_sha256 is None and version.lock_sha256 is None
+    session.commit.assert_called_once()
+    factory.assert_not_called()
+    assert {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()} == before
+
+
+@pytest.mark.parametrize("source", ["scheme", "template"])
+def test_successful_build_callback_still_rejects_retired_execution(submission, source):
+    version, session, factory, _, _ = submission
+    project = session.get.return_value
+    if source == "scheme":
+        project.scheme_version = "v1.1.0"
+    else:
+        project.template_tag = "v1.0.1"
+    with pytest.raises(HTTPException) as error:
+        submit(version, session)
+    assert error.value.status_code == 422
+    assert error.value.detail["code"] == "version_retired"
+    assert version.status == "building"
+    session.commit.assert_not_called()
+    factory.assert_not_called()
+
+
+@pytest.mark.parametrize("status", ["failed", "success"])
+def test_late_failed_build_callback_preserves_completed_record(submission, status):
+    version, session, factory, _, _ = submission
+    version.status = status
+    version.error = "已完成的状态"
+    version.finished_at = datetime.now(UTC)
+    finished = version.finished_at
+    result = versions.submit_version(
+        version.project_id, version.id, versions.BuildResult(error="迟到的失败回调"), session,
+    )
+    assert result["phase"] == status
+    assert version.error == "已完成的状态"
+    assert version.finished_at == finished
+    session.commit.assert_not_called()
+    factory.assert_not_called()
+
+
+def test_failed_build_callback_rejects_wrong_record_owner(submission):
+    version, session, factory, _, _ = submission
+    session.scalar.side_effect = None
+    session.scalar.return_value = None
+    with pytest.raises(HTTPException) as error:
+        versions.submit_version(uuid4(), version.id, versions.BuildResult(error="失败回调"), session)
+    assert error.value.status_code == 404
+    assert version.status == "building"
+    session.commit.assert_not_called()
     factory.assert_not_called()
 
 

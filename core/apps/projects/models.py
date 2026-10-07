@@ -39,6 +39,7 @@ class Project(Base):
     kind: Mapped[str] = mapped_column(String(16), comment="项目类型：factor/model/optimize/control/execution")
     template_tag: Mapped[str] = mapped_column(String(128), comment="创建项目时选择的模板 Git Tag")
     template_commit: Mapped[str] = mapped_column(String(40), comment="实际使用的模板 Git commit SHA")
+    template_package_version: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="创建时验证的模板实际 package version，绑定 template_commit；旧记录为空")
     scheme_version: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="创建项目时选择的 scheme Git Tag；旧项目未记录时为空")
     scheme_commit: Mapped[str | None] = mapped_column(String(40), nullable=True, comment="实际使用的 scheme Git commit SHA")
     archived: Mapped[bool] = mapped_column(Boolean, default=False, comment="是否已删除隐藏；源码和成果保留")

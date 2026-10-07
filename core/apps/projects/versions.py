@@ -2,19 +2,19 @@
 import hashlib
 import json
 import re
+import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-import tomllib
-from config import DolphinSchedulerSettings, SoloSettings
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
+from config import DolphinSchedulerSettings, SoloSettings
 from core.apps import version_policy as policy
 from core.scheduler.client import DolphinSchedulerClient, DolphinSchedulerError
 from core.scheduler.task_logs import worker_task_log_page
@@ -168,6 +168,11 @@ def submit_version(project_id: UUID, version_id: UUID, body: BuildResult, sessio
         return read_version(version)
     if version.status not in {"building", "submit_failed"}:
         return read_version(version)  # 网络重试不重复提交工作流。
+    if body.error:
+        version.status, version.error = "failed", body.error
+        version.finished_at = datetime.now(UTC)
+        session.commit()
+        return read_version(version)
     project = get_project_or_404(session, project_id)
     try:
         reason = policy.source_reason(policy.project_sources(project)) or (
@@ -177,11 +182,6 @@ def submit_version(project_id: UUID, version_id: UUID, body: BuildResult, sessio
             raise policy.VersionPolicyError(reason)
     except policy.VersionPolicyError as error:
         raise HTTPException(422, error.detail) from error
-    if body.error:
-        version.status, version.error = "failed", body.error
-        version.finished_at = datetime.now(UTC)
-        session.commit()
-        return read_version(version)
     directory = version_directory(version)
     try:
         project = get_project_or_404(session, project_id)

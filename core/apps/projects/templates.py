@@ -3,6 +3,7 @@
 import re
 import stat
 import subprocess
+import tomllib
 from base64 import b64decode
 from functools import lru_cache
 from io import BytesIO
@@ -14,11 +15,10 @@ from zipfile import BadZipFile, ZipFile
 
 import requests
 import tomlkit
-import tomllib
-from config import SoloSettings
 from packaging.requirements import Requirement
 from packaging.version import Version
 
+from config import SoloSettings
 from core.apps import version_policy as policy
 
 from .schemas import ProjectKind, TemplateVersion
@@ -82,7 +82,7 @@ def list_scheme_versions(refresh: bool = False) -> list[TemplateVersion]:
     result = []
     for release in repository_versions(SoloSettings.SCHEME_REPOSITORY, refresh):
         # Known retired identities need no additional remote metadata request.
-        if policy.release_reason("scheme", tag=release.tag, commit=release.commit):
+        if policy.retired_release("scheme", tag=release.tag, commit=release.commit):
             continue
         actual = project_metadata(SoloSettings.SCHEME_REPOSITORY, release.commit, "pyproject.toml")["version"]
         try:
@@ -94,7 +94,9 @@ def list_scheme_versions(refresh: bool = False) -> list[TemplateVersion]:
 
 
 def select_scheme(tag: str) -> TemplateVersion:
-    policy.require_release("scheme", tag=tag)
+    retired = policy.retired_release("scheme", tag=tag)
+    if retired:
+        raise policy.VersionPolicyError(retired["reason"])
     selected = next((v for v in list_scheme_versions() if v.tag == tag), None)
     if selected is None:
         raise ValueError("scheme 版本不存在或已退役，请刷新版本列表")
@@ -135,7 +137,7 @@ def list_versions(kind: ProjectKind, scheme_version: str, refresh: bool = False)
     scheme = Version(actual)
     result = []
     for release in repository_versions(SoloSettings.TEMPLATE_REPOSITORY, refresh):
-        if policy.release_reason("template", tag=release.tag, commit=release.commit):
+        if policy.retired_release("template", tag=release.tag, commit=release.commit):
             continue
         project = project_metadata(SoloSettings.TEMPLATE_REPOSITORY, release.commit, f"{kind}/pyproject.toml")
         try:
@@ -143,7 +145,7 @@ def list_versions(kind: ProjectKind, scheme_version: str, refresh: bool = False)
             validate_template(project, scheme)
         except ValueError:
             continue
-        result.append(release)
+        result.append(release.model_copy(update={"version": project["version"]}))
     return result
 
 

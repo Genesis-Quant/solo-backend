@@ -3,10 +3,12 @@ import importlib
 import json
 import sys
 from collections.abc import Sequence
-from types import SimpleNamespace
-from typing import Any
+from types import SimpleNamespace, UnionType
+from typing import Any, Union, get_args, get_origin
 
 from pydantic import AliasChoices, AliasPath, BaseModel, TypeAdapter
+from pydantic.json_schema import GenerateJsonSchema
+from pydantic_core import core_schema
 
 COMMON = {"start", "end", "pool", "lookback", "market_data", "benchmark", "batch_days", "cash", "commission", "tax"}
 STAGES = {"model", "optimize", "control", "execution"}
@@ -65,21 +67,69 @@ def _project_parameters(model: type[BaseModel], source: BaseModel) -> BaseModel:
     return model.model_validate(SimpleNamespace(**values), from_attributes=True)
 
 
+def _form_key(model: type[BaseModel], name: str) -> str:
+    alias = model.model_fields[name].validation_alias if model.model_config.get("validate_by_alias") is not False else None
+    if isinstance(alias, AliasChoices):
+        alias = next((choice for choice in alias.choices if isinstance(choice, str)), None)
+        if alias is None:
+            raise ValueError(f"Form 字段 {name!r} 的 AliasPath 不支持扁平表单 JSON（unsupported）")
+    if isinstance(alias, AliasPath):
+        raise ValueError(f"Form 字段 {name!r} 的 AliasPath 不支持扁平表单 JSON（unsupported）")
+    return alias if isinstance(alias, str) else name
+
+
+def _form_value(value: Any, annotation: Any = Any) -> Any:
+    """Encode defaults/saved canonical values with each nested model's validation keys."""
+    if isinstance(value, BaseModel):
+        annotation, value = type(value), dict(value)
+    origin, args = get_origin(annotation), get_args(annotation)
+    if origin in (Union, UnionType) and value is not None:
+        models = [arg for arg in args if isinstance(arg, type) and issubclass(arg, BaseModel)]
+        if len(models) == 1 and isinstance(value, dict):
+            annotation = models[0]
+    if isinstance(value, dict):
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            fields = annotation.model_fields
+            wire = {name: _form_key(annotation, name) for name in fields}
+            canonical = {key: name for name, key in wire.items()}
+            result = {}
+            for key, item in value.items():
+                name = key if key in fields else canonical.get(key)
+                if name is None:
+                    result[key] = _form_value(item)  # Unknown inputs must still reach validation.
+                else:
+                    result[wire[name]] = _form_value(item, fields[name].annotation)
+            return result
+        item_type = args[1] if origin is dict and len(args) == 2 else Any
+        return {key: _form_value(item, item_type) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        item_type = args[0] if args else Any
+        return [_form_value(item, item_type) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value  # Saved JSON scalars are already encoded; do not coerce or drop invalid inputs.
+    return TypeAdapter(annotation).dump_python(value, mode="json", by_alias=False)
+
+
+class _FormSchema(GenerateJsonSchema):
+    def model_schema(self, schema: core_schema.ModelSchema) -> dict:
+        previous = self.by_alias
+        self.by_alias = schema["cls"].model_config.get("validate_by_alias") is not False
+        try:
+            return super().model_schema(schema)
+        finally:
+            self.by_alias = previous
+
+    def encode_default(self, value: Any) -> Any:
+        return super().encode_default(_form_value(value))
+
+
 def _form_schema(model: type[BaseModel]) -> tuple[dict, dict[str, str]]:
-    """Map canonical business fields to the flat validation schema's wire keys."""
-    by_alias = model.model_config.get("validate_by_alias") is not False
-    schema = model.model_json_schema(by_alias=by_alias, mode="validation")
+    """Keep Pydantic's refs/required handling, scoped to each model's alias policy."""
+    schema = model.model_json_schema(mode="validation", schema_generator=_FormSchema)
     properties = schema.get("properties", {})
     wire = {}
-    for name, field in model.model_fields.items():
-        alias = field.validation_alias if by_alias else None
-        if isinstance(alias, AliasChoices):
-            alias = next((choice for choice in alias.choices if isinstance(choice, str)), None)
-            if alias is None:
-                raise ValueError(f"Form 字段 {name!r} 的 AliasPath 不支持扁平表单 JSON（unsupported）")
-        if isinstance(alias, AliasPath):
-            raise ValueError(f"Form 字段 {name!r} 的 AliasPath 不支持扁平表单 JSON（unsupported）")
-        key = alias if isinstance(alias, str) else name
+    for name in model.model_fields:
+        key = _form_key(model, name)
         if key not in properties or key in wire.values():
             raise ValueError(f"Form 字段 {name!r} 无法唯一对应 schema wire key {key!r}（unsupported）")
         wire[name] = key
@@ -108,7 +158,7 @@ def inspect(data: dict) -> dict:
         schema["properties"] = {key: value for key, value in schema["properties"].items() if key in published}
         schema["required"] = [key for key in schema.get("required", []) if key in published]
         values = {
-            wire[name]: TypeAdapter(field.annotation).dump_python(field.get_default(call_default_factory=True), mode="json")
+            wire[name]: _form_value(field.get_default(call_default_factory=True), field.annotation)
             for name, field in form.model_fields.items() if name in names and not field.is_required()
         }
         saved = data.get("saved", {})
@@ -119,6 +169,9 @@ def inspect(data: dict) -> dict:
                 values[wire["pool"]] = saved["universe"]["pool"]
             if "lookback" in names and "lookback" in saved.get("universe", {}):
                 values[wire["lookback"]] = saved["universe"]["lookback"]
+        for name in names:
+            if wire[name] in values:
+                values[wire[name]] = _form_value(values[wire[name]], form.model_fields[name].annotation)
         return {"schema": schema, "values": values}
     unknown = set(data["values"]) - published
     if unknown:
@@ -132,11 +185,22 @@ def inspect(data: dict) -> dict:
         for name, field in form.model_fields.items():
             if (field.json_schema_extra or {}).get("x-algo-kind"):
                 values[wire[name]] = data["entries"].get(name) or f"default:{name}"
-        built = form.model_validate(values).build()
+        validated = form.model_validate(values)
+        common = {
+            name: TypeAdapter(form.model_fields[name].annotation).dump_python(
+                getattr(validated, name), mode="json", by_alias=False,
+            )
+            for name in form.model_fields if name in COMMON
+        } if kind == "model" else {}
+        built = validated.build()
         # 该脚本也在旧 Scheme 的隔离环境中运行，不依赖新增的投影辅助函数。
         params = _project_parameters(parameter_type(algo), built)
-        return {"backtest": built.model_dump(mode="json"), "params": params.model_dump(mode="json")}
-    return {"params": form.model_validate(data["values"]).model_dump(mode="json")}
+        result = {"backtest": built.model_dump(mode="json", by_alias=False),
+                  "params": params.model_dump(mode="json", by_alias=False)}
+        if kind == "model":
+            result["common"] = common
+        return result
+    return {"params": form.model_validate(data["values"]).model_dump(mode="json", by_alias=False)}
 
 
 if __name__ == "__main__":

@@ -1,12 +1,19 @@
+import hashlib
 import json
 import re
+import subprocess
+import tomllib
 from io import BytesIO
 from pathlib import Path
 from uuid import UUID
 from zipfile import ZipFile
 
 import pytest
-import tomllib
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
+
 from config import SoloSettings
 from core.apps import version_policy as policy
 from core.apps.projects import templates, views
@@ -15,11 +22,7 @@ from core.apps.projects.models import Project
 from core.apps.projects.schemas import TemplateVersion
 from core.database.base import Base
 from core.database.session import get_database_session
-from fastapi.testclient import TestClient
 from main import app
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import Session
-from sqlalchemy.pool import StaticPool
 
 
 def archive_content(kind: str, extra: str | None = None) -> bytes:
@@ -48,9 +51,10 @@ def projects_client(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(templates, "project_metadata", lambda *args: {"version": "1.2.0"})
     monkeypatch.setattr(templates, "create_directory", lambda kind, commit, directory, suffix: templates.unpack_template(archive_content(kind), kind, directory, suffix))
 
-    def prepare(directory, project_id, name):
+    def prepare(directory, project_id, name, *, locked=False):
         (directory / ".venv").mkdir()
-        (directory / "uv.lock").write_text('[[package]]\nname="scheme"\nversion="1.2.0"\n')
+        if not locked:
+            (directory / "uv.lock").write_text('[[package]]\nname="scheme"\nversion="1.2.0"\n')
         kernel = kernel_directory(project_id)
         kernel.mkdir(parents=True, exist_ok=True)
         (kernel / "kernel.json").write_text(json.dumps({"display_name": name}))
@@ -78,7 +82,7 @@ def test_create_read_rename_archive(projects_client, kind):
     project = response.json()
     directory = root / "projects" / kind / "测试 项目"
     metadata = json.loads((directory / ".solo").read_text(encoding="utf-8"))
-    assert metadata == {"project_id": project["id"], "name": "测试 项目", "kind": kind, "scheme_version": "v1.2.0", "scheme_commit": "b" * 40, "algo_version": "v1.2.0", "algo_commit": "a" * 40}
+    assert metadata == {"project_id": project["id"], "name": "测试 项目", "kind": kind, "scheme_version": "v1.2.0", "scheme_commit": "b" * 40, "algo_version": "v1.2.0", "algo_commit": "a" * 40, "template_package_version": "1.2.0"}
     assert project["directory"] == f"projects/{kind}/测试 项目"
     assert project["schemeVersion"] == "v1.2.0"
     assert project["schemeCommit"] == "b" * 40
@@ -156,7 +160,8 @@ def test_rename_failure_restores_files_and_database(projects_client, monkeypatch
     client, root, _ = projects_client
     project = client.post("/api/v1/projects", json={"name": "原项目", "kind": "factor", "scheme_version": "v1.2.0", "algo_version": "v1.2.0"}).json()
 
-    def fail(*args):
+    def fail(*args, **kwargs):
+        assert kwargs == {"locked": True}
         raise EnvironmentError("安装失败")
 
     monkeypatch.setattr(views, "prepare_environment", fail)
@@ -280,7 +285,7 @@ def test_template_version_compatibility(template_metadata, dependencies, scheme_
         with pytest.raises(ValueError):
             templates.list_versions("factor", selected.tag)
         return
-    assert templates.list_versions("factor", selected.tag) == ([release] if compatible else [])
+    assert templates.list_versions("factor", selected.tag) == ([release.model_copy(update={"version": project_version})] if compatible else [])
 
 
 @pytest.mark.parametrize("dependencies,scheme_version,project_version,compatible", SCHEME_COMPATIBILITY)
@@ -324,4 +329,160 @@ def test_template_selection_skips_invalid_release_and_keeps_compatible(monkeypat
     monkeypatch.setattr(templates, "project_metadata", lambda repository, commit, path: (
         {"version": "1.2.0"} if repository == SoloSettings.SCHEME_REPOSITORY else metadata[commit]
     ))
-    assert templates.list_versions("factor", selected.tag) == [releases[2]]
+    assert templates.list_versions("factor", selected.tag) == [releases[2].model_copy(update={"version": "1.2.7"})]
+
+
+def directory_digest(directory):
+    return {str(path.relative_to(directory)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in directory.rglob("*") if path.is_file()}
+
+
+@pytest.mark.parametrize("failure", ["uv-conflict", "retired-postcheck", "changed-source"])
+def test_rename_locked_environment_failure_restores_exact_source_tree(projects_client, monkeypatch, failure):
+    from core.apps.projects import environment
+
+    client, root, engine = projects_client
+    project = client.post("/api/v1/projects", json={
+        "name": "original", "kind": "model", "scheme_version": "v1.2.0", "algo_version": "v1.2.0",
+    }).json()
+    source = root / "projects/model/original"
+    (source / ".venv/installed.txt").write_bytes(b"original exact environment")
+    # The TOML was edited without re-locking. Renaming must validate this input
+    # with --locked, not resolve it and silently replace the active old lock.
+    path = source / "pyproject.toml"
+    if failure == "uv-conflict":
+        path.write_text(path.read_text(encoding="utf-8").replace(
+            "scheme>=1.2.0,<1.3.0", "scheme>=1.1.0,<1.2.0"), encoding="utf-8")
+    before = directory_digest(source)
+    kernel = kernel_directory(project["id"]) / "kernel.json"
+    old_kernel = kernel.read_bytes()
+    old_lock = (source / "uv.lock").read_bytes()
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        assert args[:2] == ["uv", "sync"]
+        assert "--locked" in args
+        renamed = Path(args[args.index("--project") + 1])
+        assert (renamed / "uv.lock").read_bytes() == old_lock
+        (renamed / ".venv").mkdir()
+        (renamed / ".venv/partial.txt").write_text("must be discarded")
+        if failure == "uv-conflict":
+            # Model even a faulty installer that writes before returning failure.
+            (renamed / "uv.lock").write_text('[[package]]\nname="scheme"\nversion="1.1.7"\n')
+            (renamed / "research.ipynb").write_text('{"metadata":{"changed":true}}')
+            kernel.write_text("changed")
+            return subprocess.CompletedProcess(args, 1, "", "lockfile needs to be updated, but --locked was provided")
+        if failure == "retired-postcheck":
+            (renamed / "uv.lock").write_text('[[package]]\nname="scheme"\nversion="1.1.7"\n')
+        else:
+            pyproject = renamed / "pyproject.toml"
+            pyproject.write_text(pyproject.read_text(encoding="utf-8").replace('b' * 40, 'c' * 40), encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def rebuild(directory, project_id, name, *, locked=False):
+        if failure == "uv-conflict":
+            return environment.prepare_environment(directory, project_id, name, locked=locked)
+        assert locked is True
+        run(["uv", "sync", "--project", str(directory), "--locked"])
+        kernel.write_text("changed")
+        (directory / "research.ipynb").write_text('{"metadata":{"changed":true}}')
+
+    monkeypatch.setattr(environment.subprocess, "run", run)
+    monkeypatch.setattr(views, "prepare_environment", rebuild)
+    response = client.patch(f"/api/v1/projects/{project['id']}", json={"name": "renamed", "description": "new"})
+    assert response.status_code == {"uv-conflict": 502, "retired-postcheck": 422, "changed-source": 503}[failure], response.text
+    if failure == "retired-postcheck":
+        assert response.json()["detail"]["code"] == "version_retired"
+    assert len(calls) == 1
+    assert directory_digest(source) == before
+    assert kernel.read_bytes() == old_kernel
+    assert not source.with_name("renamed").exists()
+    assert not list(source.parent.glob(".rename-*"))
+    with Session(engine) as session:
+        saved = session.get(Project, UUID(project["id"]))
+        assert saved.name == "original" and saved.description == ""
+
+
+@pytest.mark.parametrize("tag", ["stable-current", "v1.1.42"])
+def test_creation_metadata_custom_or_misleading_tags_stays_active_offline(projects_client, monkeypatch, tag):
+    client, root, engine = projects_client
+    scheme = TemplateVersion(tag=tag, commit="b" * 40)
+    release = TemplateVersion(tag=tag, commit="a" * 40)
+    monkeypatch.setattr(templates, "list_scheme_versions", lambda refresh=False: [scheme.model_copy(update={"version": "1.2.0"})])
+    monkeypatch.setattr(templates, "list_versions", lambda *args: [release.model_copy(update={"version": "1.2.0"})])
+    response = client.post("/api/v1/projects", json={
+        "name": "metadata", "kind": "factor", "scheme_version": tag, "algo_version": tag,
+    })
+    assert response.status_code == 201, response.text
+    identifier = response.json()["id"]
+    assert response.json()["retired"] is False
+    with Session(engine) as session:
+        saved = session.get(Project, UUID(identifier))
+        assert saved.template_package_version == "1.2.0"
+        assert policy.project_sources(saved)["template"] == {"tag": tag, "commit": "a" * 40, "version": "1.2.0"}
+    # Editing a candidate patch is not a change of the creation template release.
+    path = root / "projects/factor/metadata/pyproject.toml"
+    path.write_text(path.read_text(encoding="utf-8").replace('version = "1.2.0"', 'version = "1.2.99"'), encoding="utf-8")
+
+    def offline(*args, **kwargs):
+        raise AssertionError("project reads/check/save must not fetch remote metadata")
+
+    monkeypatch.setattr(templates, "project_metadata", offline)
+    assert client.get(f"/api/v1/projects/{identifier}").json()["retired"] is False
+    assert client.get("/api/v1/projects").json()[0]["retired"] is False
+    assert client.post(f"/api/v1/version-policy/projects/{identifier}/check").json() == {"allowed": True}
+    saved = client.post(f"/api/v1/projects/{identifier}/versions", json={})
+    assert saved.status_code == 201, saved.text
+    assert saved.json()["packageVersion"] == "1.2.1"
+
+
+@pytest.mark.parametrize("scheme_tag,template_tag", [("stable-current", "stable-current"), ("v1.1.42", "v1.1.42")])
+def test_catalog_uses_exact_identity_then_actual_metadata(monkeypatch, scheme_tag, template_tag):
+    scheme = TemplateVersion(tag=scheme_tag, commit="b" * 40)
+    release = TemplateVersion(tag=template_tag, commit="a" * 40)
+    monkeypatch.setattr(templates, "repository_versions", lambda repository, refresh=False:
+                        [scheme] if repository == SoloSettings.SCHEME_REPOSITORY else [release])
+    calls = []
+
+    def metadata(repository, commit, path):
+        calls.append((commit, path))
+        return {"version": "1.2.0", "dependencies": ["scheme>=1.2.0,<1.3.0"]}
+
+    monkeypatch.setattr(templates, "project_metadata", metadata)
+    assert templates.select_scheme(scheme.tag).version == "1.2.0"
+    assert templates.list_versions("factor", scheme.tag) == [release.model_copy(update={"version": "1.2.0"})]
+    assert (release.commit, "factor/pyproject.toml") in calls
+
+
+@pytest.mark.parametrize("kind", ["scheme", "template"])
+@pytest.mark.parametrize("identity", ["tag", "commit"])
+def test_catalog_known_retired_identity_cannot_be_moved_to_active_metadata(monkeypatch, kind, identity):
+    retired = policy.load_policy()["retired_releases"][kind][0]
+    release = TemplateVersion(tag=retired["tag"] if identity == "tag" else "stable-current",
+                              commit=retired["commit"] if identity == "commit" else "f" * 40)
+    monkeypatch.setattr(templates, "repository_versions", lambda *args: [release])
+
+    def metadata(*args):
+        raise AssertionError("known retired identities must be excluded before metadata")
+
+    monkeypatch.setattr(templates, "project_metadata", metadata)
+    if kind == "scheme":
+        assert templates.list_scheme_versions() == []
+    else:
+        monkeypatch.setattr(templates, "select_scheme", lambda *args: TemplateVersion(tag="v1.2.0", commit="b" * 40, version="1.2.0"))
+        assert templates.list_versions("factor", "v1.2.0") == []
+
+
+@pytest.mark.parametrize("kind", ["scheme", "template"])
+def test_custom_tag_actual_metadata_below_floor_is_still_rejected(monkeypatch, kind):
+    active = TemplateVersion(tag="stable-current", commit="b" * 40, version="1.2.0")
+    monkeypatch.setattr(templates, "repository_versions", lambda *args: [active])
+    monkeypatch.setattr(templates, "project_metadata", lambda *args: {
+        "version": "1.1.42", "dependencies": ["scheme>=1.1.0,<1.2.0"],
+    })
+    if kind == "scheme":
+        assert templates.list_scheme_versions() == []
+    else:
+        monkeypatch.setattr(templates, "select_scheme", lambda *args: active)
+        assert templates.list_versions("factor", active.tag) == []

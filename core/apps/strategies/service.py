@@ -3,16 +3,16 @@ import json
 import os
 import shutil
 import subprocess
+import tomllib
 from pathlib import Path
 from uuid import UUID
 
 import tomlkit
-import tomllib
-from config import SoloSettings
 from fastapi import HTTPException
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
+from config import SoloSettings
 from core.apps import version_policy as policy
 from core.apps.projects.models import Project, ProjectVersion
 from core.apps.projects.versions import version_directory
@@ -120,8 +120,10 @@ def inspect_component(components: dict, kind: str, values: dict | None = None, c
 
 def build(components: dict, forms: dict, destination: Path) -> str:
     require_components(components)
-    common = forms["model"]
-    inspected = {kind: inspect_component(components, kind, forms[kind], common) for kind in KINDS}
+    inspected = {"model": inspect_component(components, "model", forms["model"])}
+    common = inspected["model"].get("common", {})
+    for kind in KINDS[1:]:
+        inspected[kind] = inspect_component(components, kind, forms[kind], common)
     backtest = inspected["model"]["backtest"]
     # 当前模型的研究选项不决定已选定的链路。
     for key in KINDS:

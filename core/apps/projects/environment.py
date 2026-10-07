@@ -2,8 +2,8 @@
 
 import json
 import os
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 from config import SoloSettings
 
@@ -16,7 +16,7 @@ def kernel_directory(project_id: str) -> Path:
     return SoloSettings.HOME_DIR / ".jupyter" / "kernels" / f"solo-{project_id}"
 
 
-def prepare_environment(directory: Path, project_id: str, name: str) -> None:
+def prepare_environment(directory: Path, project_id: str, name: str, *, locked: bool = False) -> None:
     env = {
         **os.environ,
         "UV_PROJECT_ENVIRONMENT": str(directory / ".venv"),
@@ -28,7 +28,8 @@ def prepare_environment(directory: Path, project_id: str, name: str) -> None:
     }
     try:
         result = subprocess.run(
-            ["uv", "sync", "--project", str(directory), "--python", "3.12", "--managed-python"],
+            ["uv", "sync", "--project", str(directory), "--python", "3.12", "--managed-python",
+             *(["--locked"] if locked else [])],
             env=env, capture_output=True, text=True, timeout=600,
         )
     except subprocess.TimeoutExpired as error:

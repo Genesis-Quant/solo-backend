@@ -10,6 +10,12 @@ from uuid import uuid4
 from zipfile import ZipFile
 
 import pytest
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
+
 from config import SoloSettings
 from core.apps import version_policy as policy
 from core.apps.projects import templates, versions, views
@@ -20,12 +26,7 @@ from core.apps.strategies import views as strategy_views
 from core.apps.strategies.models import Strategy
 from core.database.base import Base
 from core.database.session import get_database_session
-from fastapi import HTTPException
-from fastapi.testclient import TestClient
 from main import app
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import Session
-from sqlalchemy.pool import StaticPool
 
 SCHEME_OLD = "44e636ac754e0316d7142674ebad022a14b51b78"
 TEMPLATE_OLD = "17546a61e3bd602f4f3c7598e996d531e804dbcd"
@@ -528,3 +529,47 @@ def test_known_active_unsaved_transitive_wheel_must_obey_complete_minor_contract
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "task_identity_mismatch"
     assert "主、次版本" in response.json()["detail"]["reason"] or "完整 patch 范围" in response.json()["detail"]["reason"]
+
+
+@pytest.mark.parametrize("tag,actual,allowed", [
+    ("stable-current", "1.2.0", True),
+    ("v1.1.42", "1.2.0", True),
+    ("stable-current", None, False),
+    ("v1.2.0", None, True),
+    ("stable-current", "1.1.42", False),
+])
+def test_project_template_creation_version_is_offline_and_legacy_custom_fails_closed(policy_client, monkeypatch, tag, actual, allowed):
+    client, session, root = policy_client
+    project = project_record(session, root, scheme_tag="v1.1.42", template_tag=tag)
+    project.template_package_version = actual
+    session.commit()
+    before = project.updated_at
+    remote = MagicMock(side_effect=AssertionError("must not fetch metadata on historical reads/check"))
+    monkeypatch.setattr(templates, "project_metadata", remote)
+    response = client.get(f"/api/v1/projects/{project.id}")
+    assert response.status_code == 200
+    assert response.json()["retired"] is not allowed
+    check = client.post(f"/api/v1/version-policy/projects/{project.id}/check")
+    assert check.status_code == (200 if allowed else 422), check.text
+    if actual is None and tag == "stable-current":
+        assert check.json()["detail"]["code"] == "invalid_version_source"
+    assert project.template_package_version == actual
+    assert project.updated_at == before
+    remote.assert_not_called()
+
+
+@pytest.mark.parametrize("source", ["scheme_tag", "scheme_commit", "template_tag", "template_commit"])
+def test_persisted_active_template_actual_never_overrides_retired_identity(policy_client, source):
+    client, session, root = policy_client
+    kwargs = {
+        "scheme_tag": {"scheme_tag": "v1.1.0"},
+        "scheme_commit": {"scheme_commit": SCHEME_OLD},
+        "template_tag": {"template_tag": "v1.0.1"},
+        "template_commit": {"template_commit": TEMPLATE_OLD},
+    }[source]
+    project = project_record(session, root, **kwargs)
+    project.template_package_version = "1.2.0"
+    session.commit()
+    response = client.post(f"/api/v1/version-policy/projects/{project.id}/check")
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "version_retired"

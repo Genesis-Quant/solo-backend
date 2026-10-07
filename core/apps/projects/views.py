@@ -1,18 +1,19 @@
 import json
 import shutil
 import tempfile
+import tomllib
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote, urlencode
 from uuid import UUID, uuid4
 
-from config import SoloSettings
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from config import SoloSettings
 from core.apps import version_policy as policy
 from core.database.session import get_database_session
 
@@ -40,6 +41,7 @@ def write_project_metadata(project: Project, directory: Path) -> None:
         "project_id": str(project.id), "name": project.name, "kind": project.kind,
         "scheme_version": project.scheme_version, "scheme_commit": project.scheme_commit,
         "algo_version": project.template_tag, "algo_commit": project.template_commit,
+        "template_package_version": project.template_package_version,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -105,15 +107,20 @@ def get_project(project_id: UUID, session: Database) -> ProjectRead:
 @router.post("/projects", response_model=ProjectRead, status_code=201)
 def create_project(body: ProjectCreate, session: Database) -> ProjectRead:
     try:
-        policy.require_release("scheme", tag=body.scheme_version)
-        policy.require_release("template", tag=body.algo_version)
+        for kind, tag in (("scheme", body.scheme_version), ("template", body.algo_version)):
+            retired = policy.retired_release(kind, tag=tag)
+            if retired:
+                raise policy.VersionPolicyError(retired["reason"])
         scheme = templates.select_scheme(body.scheme_version)
         actual = scheme.version or templates.project_metadata(SoloSettings.SCHEME_REPOSITORY, scheme.commit, "pyproject.toml")["version"]
         policy.require_release("scheme", tag=scheme.tag, commit=scheme.commit, version=actual)
         version = next((v for v in templates.list_versions(body.kind, body.scheme_version) if v.tag == body.algo_version), None)
         if version is None:
             raise HTTPException(422, "Algo 版本不存在或不兼容所选 scheme，请刷新版本列表")
-        policy.require_release("template", tag=version.tag, commit=version.commit, version=version.version)
+        template_actual = version.version or templates.project_metadata(
+            SoloSettings.TEMPLATE_REPOSITORY, version.commit, f"{body.kind}/pyproject.toml",
+        )["version"]
+        policy.require_release("template", tag=version.tag, commit=version.commit, version=template_actual)
         used_suffixes = {identifier.hex[:4] for identifier in session.scalars(
             select(Project.id).where(Project.kind == body.kind)
         )}
@@ -124,6 +131,7 @@ def create_project(body: ProjectCreate, session: Database) -> ProjectRead:
             project_id = uuid4()
         project = Project(id=project_id, name=body.name, description=body.description, kind=body.kind,
                           template_tag=version.tag, template_commit=version.commit,
+                          template_package_version=template_actual,
                           scheme_version=scheme.tag, scheme_commit=scheme.commit)
         if session.scalar(select(Project.id).where(Project.kind == body.kind, Project.name == body.name)):
             raise HTTPException(409, "该类型下已有同名项目（包含已删除保留的项目）")
@@ -133,6 +141,9 @@ def create_project(body: ProjectCreate, session: Database) -> ProjectRead:
         destination.mkdir(parents=True, exist_ok=False)
         try:
             templates.create_directory(body.kind, version.commit, destination, project.id.hex[:4])
+            unpacked = tomllib.loads((destination / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+            if unpacked != template_actual:
+                raise ValueError("模板归档实际版本与所选 commit 的 metadata 不一致")
             templates.pin_scheme(destination, scheme)
             write_project_metadata(project, destination)
             prepare_environment(destination, str(project.id), project.name)
@@ -167,28 +178,45 @@ def edit_project(project_id: UUID, body: ProjectEdit, session: Database) -> Proj
         project.description = body.description
         session.commit()
         return read_project(project)
+    source = project_directory(project)
     try:
-        policy.require_project(project)
+        original_lock = (source / "uv.lock").read_bytes()
+        original_scheme = policy.require_project(project, lock=tomllib.loads(original_lock.decode("utf-8")))
+        original_pyproject = (source / "pyproject.toml").read_bytes()
+        scheme_source = tomllib.loads(original_pyproject.decode("utf-8")).get("tool", {}).get("uv", {}).get("sources", {}).get("scheme", {})
+        retired = policy.retired_release("scheme", tag=scheme_source.get("tag"), commit=scheme_source.get("rev"))
+        if retired:
+            raise policy.VersionPolicyError(retired["reason"])
     except policy.VersionPolicyError as error:
         raise HTTPException(422, error.detail) from error
-    source = project_directory(project)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise HTTPException(422, {"code": "invalid_version_source", "reason": "项目环境尚未记录有效的冻结来源"}) from error
     destination = source.with_name(body.name)
     if destination.exists() or session.scalar(select(Project.id).where(Project.kind == project.kind, Project.name == body.name)):
         raise HTTPException(409, "该类型下已有同名项目或目录")
     if not source.is_dir():
         raise HTTPException(409, "项目目录不存在，请检查共享卷挂载")
     # 虚拟环境含绝对路径；重命名时重建环境，并保留原环境供失败回滚。
-    backup = Path(tempfile.mkdtemp(prefix=".rename-", dir=source.parent))
     kernel_file = kernel_directory(str(project.id)) / "kernel.json"
     old_kernel = kernel_file.read_bytes()
-    old_metadata = (source / ".solo").read_bytes()
-    old_notebook = (source / "research.ipynb").read_bytes()
+    original_files = {"pyproject.toml": original_pyproject, "uv.lock": original_lock,
+                      ".solo": (source / ".solo").read_bytes(),
+                      "research.ipynb": (source / "research.ipynb").read_bytes()}
+    backup = Path(tempfile.mkdtemp(prefix=".rename-", dir=source.parent))
     try:
         source.rename(destination)
         (destination / ".venv").rename(backup / ".venv")
         project.name, project.description = body.name, body.description
         write_project_metadata(project, destination)
-        prepare_environment(destination, str(project.id), project.name)
+        prepare_environment(destination, str(project.id), project.name, locked=True)
+        # Admission is repeated after installation, before any database commit.
+        # --locked validates edited TOML against the original lock; it must never
+        # resolve a newer/retired Scheme or replace any accepted package source.
+        if policy.require_project(project) != original_scheme:
+            raise ValueError("重命名不能改变实际 Scheme")
+        if ((destination / "uv.lock").read_bytes() != original_lock
+                or (destination / "pyproject.toml").read_bytes() != original_pyproject):
+            raise ValueError("重命名不能改变冻结锁文件或依赖来源")
         session.commit()
     except Exception as error:
         session.rollback()
@@ -197,9 +225,11 @@ def edit_project(project_id: UUID, body: ProjectEdit, session: Database) -> Proj
                 shutil.rmtree(destination / ".venv", ignore_errors=True)
                 (backup / ".venv").rename(destination / ".venv")
             destination.rename(source)
-            (source / ".solo").write_bytes(old_metadata)
-            (source / "research.ipynb").write_bytes(old_notebook)
+            for name, content in original_files.items():
+                (source / name).write_bytes(content)
         kernel_file.write_bytes(old_kernel)
+        if isinstance(error, policy.VersionPolicyError):
+            raise HTTPException(422, error.detail) from error
         if isinstance(error, EnvironmentError):
             raise HTTPException(502, str(error)) from error
         raise HTTPException(503, "重命名项目失败，已恢复原目录和环境") from error
