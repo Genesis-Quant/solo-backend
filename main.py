@@ -5,11 +5,12 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from config import DatabaseSettings, DolphinSchedulerSettings, SoloSettings
-from core.apps.projects.views import router as projects_router
 from core.apps.projects.versions import router as versions_router
+from core.apps.projects.views import router as projects_router
 from core.apps.strategies.views import router as strategies_router
 from core.apps.system.views import health
 from core.apps.system.views import router as system_router
+from core.apps.version_policy_views import router as version_policy_router
 from core.database.session import database_engine
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,4 +41,5 @@ app.include_router(system_router)
 app.include_router(projects_router)
 app.include_router(versions_router)
 app.include_router(strategies_router)
+app.include_router(version_policy_router)
 app.add_api_route("/health", health, methods=["GET"], tags=["system"])

@@ -1,7 +1,11 @@
 """隔离 Scheme 表单的参数投影，不运行环境安装、回测或持久化。"""
 
+import json
+import subprocess
 import sys
 from datetime import date, timedelta
+from pathlib import Path
+from textwrap import dedent
 from types import ModuleType
 
 import pytest
@@ -249,6 +253,263 @@ def test_downstream_schema_hides_shared_inputs_and_selectors(selected_form):
     assert result["values"] == {"window": 20}
     with pytest.raises(ValueError, match="未声明字段.*start"):
         inspect({**data, "values": {"start": "2026-06-01"}})
+
+
+@pytest.mark.parametrize("kind", ["model", "optimize"])
+def test_legacy_frozen_form_alias_round_trips_defaults_saved_and_submit(selected_form, kind):
+    class Params(BaseModel):
+        window: int = Field(gt=0)
+
+    class Form(BaseModel):
+        model_config = ConfigDict(frozen=True, populate_by_name=True)
+        window: int = Field(default=20, alias="lookback_days", gt=0)
+
+        def build(self):
+            return Params(window=self.window)
+
+    data = selected_form(kind, Params, Form)
+    definition = inspect(data)
+    assert set(definition["schema"]["properties"]) == {"lookback_days"}
+    assert definition["schema"]["properties"]["lookback_days"]["default"] == 20
+    assert definition["schema"]["required"] == []
+    assert definition["values"] == {"lookback_days": 20}
+    restored = inspect({**data, "saved": {"window": 17, "lookback_days": 99, "other": 5}})
+    assert restored["values"] == {"lookback_days": 17}
+    result = inspect({**data, "values": restored["values"]})
+    assert result == {"backtest": {"window": 17}, "params": {"window": 17}}
+    with pytest.raises(ValueError, match="未声明字段.*window"):
+        inspect({**data, "values": {"window": 17}})
+    with pytest.raises(ValidationError, match="lookback_days"):
+        inspect({**data, "values": {"lookback_days": 0}})
+
+
+def test_standalone_script_round_trips_frozen_form_with_only_legacy_scheme_api():
+    script = Path(__file__).resolve().parents[1] / "core/apps/strategies/parameters.py"
+    bootstrap = dedent("""\
+        import runpy
+        import sys
+        from types import ModuleType
+        from pydantic import BaseModel, ConfigDict, Field
+
+        for name in ("scheme", "scheme.execute", "scheme.execute.strategy"):
+            package = ModuleType(name)
+            package.__path__ = []
+            sys.modules[name] = package
+
+        class Params(BaseModel):
+            window: int = Field(validation_alias="runtime_days", gt=0)
+
+        class FrozenAnalysis(BaseModel):
+            model_config = ConfigDict(frozen=True)
+            window: int
+            study: str = "not a runtime field"
+
+        class FrozenForm(BaseModel):
+            model_config = ConfigDict(frozen=True)
+            window: int = Field(default=20, alias="lookback_days", gt=0)
+
+            def build(self):
+                return FrozenAnalysis(window=self.window)
+
+        module = ModuleType("frozen_form_fixture")
+        module.LegacyAlgo = type("LegacyAlgo", (), {})
+        module.ModelReportForm = FrozenForm
+        sys.modules[module.__name__] = module
+        assembly = ModuleType("scheme.execute.strategy.assembly")
+        assembly.parameter_type = lambda cls: Params
+        sys.modules[assembly.__name__] = assembly
+        runpy.run_path(sys.argv[1], run_name="__main__")
+    """)
+    data = {"kind": "model", "entry": "frozen_form_fixture:LegacyAlgo", "entries": {}}
+
+    def execute(payload):
+        return subprocess.run(
+            [sys.executable, "-B", "-c", bootstrap, str(script)],
+            input=json.dumps(payload), capture_output=True, text=True, encoding="utf-8",
+            timeout=30, check=False,
+        )
+
+    definition = execute({**data, "saved": {"window": 17}})
+    assert definition.returncode == 0, definition.stderr
+    restored = json.loads(definition.stdout)
+    assert restored["schema"]["properties"]["lookback_days"]["default"] == 20
+    assert restored["values"] == {"lookback_days": 17}
+    submitted = execute({**data, "values": restored["values"]})
+    assert submitted.returncode == 0, submitted.stderr
+    assert json.loads(submitted.stdout) == {
+        "backtest": {"window": 17, "study": "not a runtime field"},
+        "params": {"window": 17},
+    }
+    rejected = execute({**data, "values": {"window": 17}})
+    assert rejected.returncode == 1
+    assert "window" in rejected.stderr
+    assert not rejected.stdout
+
+
+@pytest.mark.parametrize("alias", [
+    "lookback_days",
+    AliasChoices("lookback_days", "legacy_days"),
+    AliasChoices(AliasPath("config", "window"), "lookback_days", "legacy_days"),
+])
+def test_form_uses_published_validation_alias_not_serialization_alias(selected_form, alias):
+    class Params(BaseModel):
+        window: int
+
+    class Form(BaseModel):
+        model_config = ConfigDict(extra="allow", populate_by_name=True)
+        window: int = Field(validation_alias=alias, serialization_alias="serialized_days")
+
+        def build(self):
+            return Params(window=self.window)
+
+    data = selected_form("optimize", Params, Form)
+    definition = inspect({**data, "saved": {"window": 17}})
+    assert set(definition["schema"]["properties"]) == {"lookback_days"}
+    assert definition["schema"]["required"] == ["lookback_days"]
+    assert definition["values"] == {"lookback_days": 17}
+    assert inspect({**data, "values": definition["values"]})["params"] == {"window": 17}
+    for unknown in ("window", "serialized_days", "legacy_days", "config", "other"):
+        with pytest.raises(ValueError, match=f"未声明字段.*{unknown}"):
+            inspect({**data, "values": {"lookback_days": 17, unknown: 99}})
+
+
+def test_alias_classification_and_injected_common_selectors_use_canonical_names(selected_form):
+    class Params(BaseModel):
+        window: int
+
+    class Analysis(Params):
+        start: date
+        end: date
+        cash: float
+        model: str
+
+    class Form(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        start: date = Field(alias="start_on")
+        end: date = Field(alias="end_on")
+        cash: float = Field(alias="initial_cash")
+        model: str = Field(alias="selected_model", json_schema_extra={"x-algo-kind": "model"})
+        window: int = Field(default=20, alias="start")
+
+        def build(self):
+            return Analysis(**self.model_dump())
+
+    data = selected_form("optimize", Params, Form)
+    definition = inspect(data)
+    assert set(definition["schema"]["properties"]) == {"start"}
+    assert definition["values"] == {"start": 20}
+    for hidden in ("start_on", "end_on", "initial_cash", "selected_model"):
+        with pytest.raises(ValueError, match=f"未声明字段.*{hidden}"):
+            inspect({**data, "values": {hidden: "not a visible parameter"}})
+    result = inspect({
+        **data, "values": {"start": 17},
+        "common": {
+            "start": "2026-06-01", "end": "2026-06-03", "cash": 123_000,
+            "window": 99, "initial_cash": 99, "unknown": "must not leak",
+            "model": "untrusted:ModelAlgo", "selected_model": "untrusted:ModelAlgo",
+        },
+        "entries": {"model": "selected:ModelAlgo"},
+    })
+    assert result["params"] == {"window": 17}
+    assert result["backtest"] == {
+        "start": "2026-06-01", "end": "2026-06-03", "cash": 123_000,
+        "window": 17, "model": "selected:ModelAlgo",
+    }
+    with pytest.raises(ValidationError, match="start_on"):
+        inspect({**data, "values": {"start": 17}, "common": {"start_on": "2026-06-01"}})
+
+
+def test_model_aliases_restore_only_declared_saved_common_fields(selected_form):
+    class Form(BaseModel):
+        start: date = Field(alias="start_on")
+        end: date = Field(alias="end_on")
+        pool: str = Field(default="沪深 300", alias="stock_pool")
+        lookback: timedelta = Field(default=timedelta(0), alias="history")
+        cash: float = Field(default=1_000_000, alias="initial_cash")
+        window: int = Field(default=20, alias="lookback_days")
+        optimize: str = Field(default="default:optimize", alias="selected_optimize")
+
+    data = selected_form("model", BaseModel, Form)
+    saved = {
+        "start": "2026-06-01", "end": "2026-06-03", "window": 17,
+        "universe": {"pool": "上证 50", "lookback": "P60D"},
+        "config": {"cash": 123_000, "unknown": 9}, "optimize": "ignored",
+    }
+    definition = inspect({**data, "saved": saved})
+    assert set(definition["schema"]["properties"]) == {
+        "start_on", "end_on", "stock_pool", "history", "initial_cash", "lookback_days",
+    }
+    assert definition["schema"]["required"] == ["start_on", "end_on"]
+    assert definition["values"] == {
+        "start_on": "2026-06-01", "end_on": "2026-06-03", "lookback_days": 17,
+        "stock_pool": "上证 50", "history": "P60D", "initial_cash": 123_000,
+    }
+
+    class MinimalForm(BaseModel):
+        window: int = Field(default=20, alias="lookback_days")
+
+    minimal = inspect({**selected_form("model", BaseModel, MinimalForm), "saved": saved})
+    assert minimal["values"] == {"lookback_days": 17}
+
+
+@pytest.mark.parametrize("alias", [
+    AliasPath("config", "window"),
+    AliasPath("lookback_days"),
+    AliasChoices(AliasPath("config", "window"), AliasPath("other", 0)),
+])
+@pytest.mark.parametrize("submit", [False, True])
+def test_form_alias_paths_without_flat_schema_key_fail_explicitly(selected_form, alias, submit):
+    class Form(BaseModel):
+        window: int = Field(default=20, validation_alias=alias)
+
+        def build(self):
+            raise AssertionError("unsupported form must not build")
+
+    data = selected_form("optimize", BaseModel, Form)
+    if submit:
+        data["values"] = {"window": 17}
+    with pytest.raises(ValueError, match="window.*AliasPath.*unsupported"):
+        inspect(data)
+
+
+def test_form_with_alias_validation_disabled_publishes_canonical_key(selected_form):
+    class Params(BaseModel):
+        window: int
+
+    class Form(BaseModel):
+        model_config = ConfigDict(validate_by_alias=False)
+        window: int = Field(default=20, alias="lookback_days")
+
+        def build(self):
+            return Params(window=self.window)
+
+    data = selected_form("optimize", Params, Form)
+    definition = inspect({**data, "saved": {"window": 17}})
+    assert set(definition["schema"]["properties"]) == {"window"}
+    assert definition["values"] == {"window": 17}
+    assert inspect({**data, "values": definition["values"]})["params"] == {"window": 17}
+    with pytest.raises(ValueError, match="未声明字段.*lookback_days"):
+        inspect({**data, "values": {"lookback_days": 17}})
+
+
+def test_builtin_alias_parameters_use_the_same_published_wire_key(monkeypatch):
+    class Params(BaseModel):
+        window: int = Field(default=20, alias="lookback_days")
+
+    module = ModuleType("scheme.base.projects.optimize.default")
+    module.RiskParity = object
+    assembly = ModuleType("scheme.execute.strategy.assembly")
+    assembly.parameter_type = lambda cls: Params
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setitem(sys.modules, assembly.__name__, assembly)
+    definition = inspect({"kind": "optimize", "saved": {"window": 17}})
+    assert set(definition["schema"]["properties"]) == {"lookback_days"}
+    assert definition["values"] == {"lookback_days": 17}
+    assert inspect({"kind": "optimize", "values": definition["values"]}) == {
+        "params": {"window": 17},
+    }
+    with pytest.raises(ValueError, match="未声明字段.*window"):
+        inspect({"kind": "optimize", "values": {"window": 17}})
 
 
 def test_builtin_default_parameters_keep_legacy_discovery(monkeypatch):

@@ -58,6 +58,8 @@ class ProjectVersion(Base):
     note: Mapped[str] = mapped_column(String(500), default="", comment="版本备注")
     status: Mapped[str] = mapped_column(String(32), default="building", comment="building/queued/running/success/failed/submit_failed")
     workflow_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="DolphinScheduler 实例 ID")
+    input_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="提交前接受的准确输入哈希")
+    lock_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="提交前接受的准确锁文件哈希")
     parameters: Mapped[dict] = mapped_column(JSON, default=dict, comment="冻结的输入参数")
     scheme_version: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="任务实际 Scheme 版本")
     error: Mapped[str] = mapped_column(Text, default="", comment="构建或运行错误")

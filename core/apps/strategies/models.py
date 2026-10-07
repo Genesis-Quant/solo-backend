@@ -17,6 +17,8 @@ class Strategy(Base):
     forms: Mapped[dict] = mapped_column(JSON, comment="各环节填写的 Form 参数")
     status: Mapped[str] = mapped_column(String(32), default="building")
     workflow_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    input_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lock_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     scheme_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

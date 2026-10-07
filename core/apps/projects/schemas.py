@@ -4,7 +4,6 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-
 type ProjectKind = Literal["factor", "model", "optimize", "control", "execution"]
 
 
@@ -46,4 +45,6 @@ class ProjectRead(BaseModel):
     updatedAt: datetime
     archived: bool
     directory: str
+    retired: bool = False
+    retiredReason: str | None = None
     versions: list[dict[str, object]] = Field(default_factory=list)

@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "retired_at": "2026-10-07T14:17:52.437273+00:00",
+  "grandfathered_runs": [],
+  "minimum_versions": {
+    "scheme": "1.2.0",
+    "template": "1.2.0"
+  },
+  "retired_releases": {
+    "scheme": [
+      {
+        "tag": "v0.1.0",
+        "commit": "ec474d2cda2c077537eb2d635a79de588468f50e",
+        "version": "0.1.0",
+        "reason": "Scheme 0.1.0 已退役，不符合完整 minor 版本契约；仅可读取历史，请使用 1.2.x。"
+      },
+      {
+        "tag": "v1.0.0",
+        "commit": "39f036c6a64f667a2586bf9a1c79c15905246e63",
+        "version": "1.0.0",
+        "reason": "Scheme 1.0.0 已退役，不符合完整 minor 版本契约；仅可读取历史，请使用 1.2.x。"
+      },
+      {
+        "tag": "v1.0.1",
+        "commit": "f2063d94dcbf13edcdaa62abb0ae7ca50d96b0cb",
+        "version": "1.0.1",
+        "reason": "Scheme 1.0.1 已退役，不符合完整 minor 版本契约；仅可读取历史，请使用 1.2.x。"
+      },
+      {
+        "tag": "v1.1.0",
+        "commit": "44e636ac754e0316d7142674ebad022a14b51b78",
+        "version": "1.1.0",
+        "reason": "Scheme 1.1.0 不符合新完整 minor 契约，已明确退役；仅可读取历史，请使用 1.2.x。"
+      }
+    ],
+    "template": [
+      {
+        "tag": "v0.1.0",
+        "commit": "a437955a8fafe759e671d4da9607edff28143285",
+        "version": "0.1.0",
+        "reason": "Algo 模板 0.1.0 已退役，未声明完整 Scheme minor 依赖范围；仅可读取历史，请使用 1.2.x。"
+      },
+      {
+        "tag": "v1.0.0",
+        "commit": "43c8df18ac3463d768ca9e9a771674186976120b",
+        "version": "1.0.0",
+        "reason": "Algo 模板 1.0.0 已退役，旧跨 minor 依赖范围不符合完整 minor 契约；仅可读取历史，请使用 1.2.x。"
+      },
+      {
+        "tag": "v1.0.1",
+        "commit": "17546a61e3bd602f4f3c7598e996d531e804dbcd",
+        "version": "1.0.1",
+        "reason": "Algo 模板 1.0.1 已退役，旧跨 minor 依赖范围不符合完整 minor 契约；仅可读取历史，请使用 1.2.x。"
+      }
+    ]
+  }
+}

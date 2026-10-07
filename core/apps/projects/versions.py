@@ -2,24 +2,25 @@
 import hashlib
 import json
 import re
-import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+import tomllib
 from config import DolphinSchedulerSettings, SoloSettings
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
+from core.apps import version_policy as policy
 from core.scheduler.client import DolphinSchedulerClient, DolphinSchedulerError
 from core.scheduler.task_logs import worker_task_log_page
 
 from .models import Project, ProjectVersion
-from .views import Database, get_project_or_404
+from .views import Database, get_project_or_404, project_directory
 
 router = APIRouter(prefix="/api/v1/projects", tags=["versions"])
 
@@ -73,7 +74,14 @@ def refresh_version(version: ProjectVersion, *, workflow_kind: str | None = None
             run = json.loads((directory / "report/run.json").read_text())
             if run["status"] != "success" or run["input_sha256"] != hashlib.sha256((directory / "input.json").read_bytes()).hexdigest():
                 raise ValueError("报告与提交输入不一致")
-            version.scheme_version = run["versions"]["scheme"]
+            data = json.loads((directory / "input.json").read_text(encoding="utf-8"))
+            _, lockfile, lock = policy.task_files(directory, workflow_kind or data["kind"])
+            actual, _ = policy.locked_scheme(lock)
+            if (policy.formal_version(run["versions"]["scheme"]) != actual
+                    or run["lock_sha256"] != hashlib.sha256(lockfile.read_bytes()).hexdigest()
+                    or (version.scheme_version and policy.formal_version(version.scheme_version) != actual)):
+                raise ValueError("报告 ActualScheme 或锁文件与任务冻结环境不一致")
+            version.scheme_version = str(actual)
             version.status = "success"
         except (OSError, KeyError, ValueError) as error:
             version.status, version.error = "failed", f"报告清单无效：{error}"
@@ -87,8 +95,10 @@ def refresh_version(version: ProjectVersion, *, workflow_kind: str | None = None
 
 def read_version(version: ProjectVersion) -> dict:
     seconds = int(((version.finished_at or datetime.now(UTC)) - version.created_at).total_seconds())
+    reason = policy.version_retirement(version)
     return {
         "id": str(version.id), "number": version.number, "packageVersion": version.package_version,
+        "retired": bool(reason), "retiredReason": reason,
         "note": version.note, "submittedAt": version.created_at.isoformat(),
         "status": "failed" if version.status == "submit_failed" else version.status if version.status in {"success", "failed"} else "running",
         "phase": version.status, "publishStatus": "unpublished", "workflowId": version.workflow_id or 0,
@@ -122,14 +132,25 @@ def create_version(project_id: UUID, body: CreateVersion, session: Database) -> 
     project = session.scalar(select(Project).where(Project.id == project_id).with_for_update())
     if project is None or project.archived:
         raise HTTPException(404, "项目不存在")
+    try:
+        reason = policy.source_reason(policy.project_sources(project))
+        if reason:
+            raise policy.VersionPolicyError(reason)
+    except policy.VersionPolicyError as error:
+        raise HTTPException(422, error.detail) from error
     if session.scalar(select(ProjectVersion.id).where(ProjectVersion.project_id == project_id, ProjectVersion.status == "building")):
         raise HTTPException(409, "当前项目已有版本正在构建")
     number = (session.scalar(select(func.max(ProjectVersion.number)).where(ProjectVersion.project_id == project_id)) or 0) + 1
     try:
-        major = int((project.scheme_version or "").lstrip("v").split(".")[0])
-    except ValueError as error:
-        raise HTTPException(422, "项目尚未记录有效的 Scheme 版本") from error
-    version = ProjectVersion(project_id=project_id, number=number, package_version=f"{major}.0.{number}", note=body.note)
+        # 标签不代表实际版本；使用项目已解析的本地冻结环境，不访问远端。
+        lock = tomllib.loads((project_directory(project) / "uv.lock").read_text(encoding="utf-8"))
+        scheme = policy.require_project(project, lock=lock)
+        policy.require_result_series(f"{scheme.major}.{scheme.minor}.{number}", scheme)
+    except policy.VersionPolicyError as error:
+        raise HTTPException(422, error.detail) from error
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise HTTPException(422, "项目环境尚未记录有效的 Scheme 主、次版本") from error
+    version = ProjectVersion(project_id=project_id, number=number, package_version=f"{scheme.major}.{scheme.minor}.{number}", note=body.note)
     session.add(version)
     project.updated_at = datetime.now(UTC)
     session.commit()
@@ -147,6 +168,15 @@ def submit_version(project_id: UUID, version_id: UUID, body: BuildResult, sessio
         return read_version(version)
     if version.status not in {"building", "submit_failed"}:
         return read_version(version)  # 网络重试不重复提交工作流。
+    project = get_project_or_404(session, project_id)
+    try:
+        reason = policy.source_reason(policy.project_sources(project)) or (
+            policy.release_reason("scheme", version=version.scheme_version) if version.scheme_version else None
+        )
+        if reason:
+            raise policy.VersionPolicyError(reason)
+    except policy.VersionPolicyError as error:
+        raise HTTPException(422, error.detail) from error
     if body.error:
         version.status, version.error = "failed", body.error
         version.finished_at = datetime.now(UTC)
@@ -154,15 +184,17 @@ def submit_version(project_id: UUID, version_id: UUID, body: BuildResult, sessio
         return read_version(version)
     directory = version_directory(version)
     try:
-        data = json.loads((directory / "input.json").read_text())
-        project = session.get(Project, project_id)
+        project = get_project_or_404(session, project_id)
         kind = project.kind
+        policy.check_task(session, version, project=project, directory=directory, kind=kind)
+        data = json.loads((directory / "input.json").read_text())
         if data["kind"] != kind:
             raise ValueError("研究类型与项目不一致")
         component = data["factor"] if kind == "factor" else data["algos"][project.kind]
         if component["version"] != version.package_version:
             raise ValueError("候选包版本或研究类型不一致")
         for file in [Path(component["wheel"]), Path(data["environment"]["lockfile"])]:
+            file = directory / file
             if not file.resolve().is_relative_to(directory.resolve()) or not file.is_file():
                 raise ValueError("任务产物不在版本目录中")
         version.parameters = (
@@ -175,12 +207,22 @@ def submit_version(project_id: UUID, version_id: UUID, body: BuildResult, sessio
                 for name, item in data["algos"].items() if item and name != project.kind
             }
         version.parameters["dependencies"] = research_dependencies(
-            Path(data["environment"]["lockfile"]), component["package"],
+            directory / data["environment"]["lockfile"], component["package"],
         )
-        version.scheme_version = json.loads((directory / "build.json").read_text())["scheme_version"]
-    except (OSError, ValueError, KeyError) as error:
+        _, lockfile, frozen = policy.task_files(directory, kind)
+        actual, _ = policy.locked_scheme(frozen)
+        built = json.loads((directory / "build.json").read_text())["scheme_version"]
+        if policy.formal_version(built) != actual:
+            raise ValueError("build.json ActualScheme 与冻结锁文件不一致")
+        version.scheme_version = str(actual)
+    except policy.VersionPolicyError as error:
+        raise HTTPException(422, error.detail) from error
+    except (OSError, ValueError, KeyError, TypeError) as error:
         raise HTTPException(422, f"构建产物不完整：{error}") from error
     # 先持久化提交意图；遇到网络超时仍按 input_file 查询实例，不盲目重试。
+    version.input_sha256 = hashlib.sha256((directory / "input.json").read_bytes()).hexdigest()
+    _, lockfile, _ = policy.task_files(directory, project.kind)
+    version.lock_sha256 = hashlib.sha256(lockfile.read_bytes()).hexdigest()
     version.status = "queued"
     version.error = ""
     version.finished_at = None

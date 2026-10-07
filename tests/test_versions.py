@@ -1,48 +1,107 @@
 """保存任务中断、调度重试和重复请求的状态回归。"""
 
+import hashlib
 import json
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 from uuid import uuid4
+from zipfile import ZipFile
 
 import pytest
-from fastapi import HTTPException
-
+from config import SoloSettings
 from core.apps.projects import versions
 from core.apps.projects.models import ProjectVersion
 from core.scheduler.client import DolphinSchedulerError
+from fastapi import HTTPException
 
 
 @pytest.fixture
 def submission(tmp_path, monkeypatch):
     version = ProjectVersion(
-        id=uuid4(), project_id=uuid4(), number=1, package_version="1.0.1",
+        id=uuid4(), project_id=uuid4(), number=1, package_version="1.2.1",
         status="building", parameters={}, error="", note="",
         created_at=datetime.now(UTC),
     )
     session = MagicMock()
     session.scalar.return_value = version
-    session.get.return_value = SimpleNamespace(kind="factor")
+    session.get.return_value = SimpleNamespace(id=version.project_id, kind="factor", archived=False, scheme_version="v1.2.0",
+                                               scheme_commit="b" * 40, template_tag="v1.2.0", template_commit="a" * 40)
+    directory = tmp_path / "runs" / str(version.id)
+    directory.mkdir(parents=True)
+    monkeypatch.setattr(SoloSettings, "SHARED_DIR", tmp_path)
     factory = MagicMock()
     client = factory.return_value.__enter__.return_value
     client.instances.return_value = []
     client.instance.return_value = {"state": "RUNNING_EXECUTION"}
     monkeypatch.setattr(versions, "DolphinSchedulerClient", factory)
-    monkeypatch.setattr(versions, "version_directory", lambda _: tmp_path)
-    for name in ("factor.whl", "uv.lock"):
-        (tmp_path / name).write_text("version = 1" if name == "uv.lock" else "candidate", encoding="utf-8")
-    (tmp_path / "input.json").write_text(json.dumps({
+    monkeypatch.setattr(versions, "version_directory", lambda _: directory)
+    package = f"factor-{version.project_id.hex[:4]}"
+    wheel = directory / "factor.whl"
+    with ZipFile(wheel, "w") as archive:
+        archive.writestr(f"{package}.dist-info/METADATA", f"Name: {package}\nVersion: 1.2.1\nRequires-Dist: scheme>=1.2.0,<1.3.0\n")
+        archive.writestr(package.replace("-", "_") + "/__init__.py", "")
+    (directory / "uv.lock").write_text(f'[[package]]\nname="scheme"\nversion="1.2.0"\n[[package]]\nname="{package}"\nversion="1.2.1"\nsource={{path="factor.whl"}}\n')
+    session.scalars.return_value = [session.get.return_value]
+    session.scalar.side_effect = lambda query: None if "project_versions.package_version =" in str(query) else version
+    (directory / "input.json").write_text(json.dumps({
         "kind": "factor",
-        "factor": {"package": "factor-test", "version": "1.0.1", "wheel": str(tmp_path / "factor.whl"), "params": {}},
-        "environment": {"lockfile": str(tmp_path / "uv.lock")}, "analysis": {},
+        "factor": {"package": package, "version": "1.2.1", "wheel": str(wheel), "params": {},
+                   "entry": f"{package.replace('-', '_')}:Factor", "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest()},
+        "environment": {"lockfile": str(directory / "uv.lock")}, "analysis": {},
     }), encoding="utf-8")
-    (tmp_path / "build.json").write_text('{"scheme_version":"1.0.0"}', encoding="utf-8")
-    return version, session, factory, client, tmp_path
+    (directory / "build.json").write_text('{"scheme_version":"1.2.0"}', encoding="utf-8")
+    return version, session, factory, client, directory
 
 
 def submit(version, session):
     return versions.submit_version(version.project_id, version.id, versions.BuildResult(), session)
+
+
+@pytest.mark.parametrize("scheme_version,series", [("1.2.0", "1.2"), ("1.2.7", "1.2"), ("1.2.99", "1.2")])
+@pytest.mark.parametrize("previous_number", [0, 7])
+def test_create_version_uses_actual_locked_scheme_series(tmp_path, monkeypatch, scheme_version, series, previous_number):
+    project = SimpleNamespace(id=uuid4(), archived=False, scheme_version="v9.9.9", scheme_commit="b" * 40,
+                              template_tag="v1.2.0", template_commit="a" * 40)
+    lock = tmp_path / "uv.lock"
+    original = f'[[package]]\nname="scheme"\nversion="{scheme_version}"\n'
+    lock.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(versions, "project_directory", lambda _: tmp_path)
+    monkeypatch.setattr(versions, "read_version", lambda version: {"packageVersion": version.package_version})
+    session = MagicMock()
+    session.scalar.side_effect = [project, None, previous_number]
+    result = versions.create_version(project.id, versions.CreateVersion(note="保存"), session)
+    version = session.add.call_args.args[0]
+    assert result["packageVersion"] == f"{series}.{previous_number + 1}"
+    assert version.number == previous_number + 1
+    assert version.note == "保存"
+    assert project.scheme_version == "v9.9.9"
+    assert lock.read_text(encoding="utf-8") == original
+    session.commit.assert_called_once()
+
+
+@pytest.mark.parametrize("content", [
+    None, "not valid toml", "version = 1", '[[package]]\nname="other"\nversion="1.1.0"\n',
+    '[[package]]\nname="scheme"\nversion="invalid"\n', '[[package]]\nname="scheme"\n',
+    '[[package]]\nname="scheme"\nversion="1.1.0"\n[[package]]\nname="scheme"\nversion="1.1.7"\n',
+    *[f'[[package]]\nname="scheme"\nversion="{value}"\n' for value in (
+        "1.1.7rc1", "1.1.7.dev1", "1.1.7.post1", "1.1.7+local", "1!1.1.7", "1.1.7.0",
+    )],
+])
+def test_create_version_rejects_missing_or_ambiguous_scheme_lock(tmp_path, monkeypatch, content):
+    project = SimpleNamespace(id=uuid4(), archived=False, scheme_version="v1.2.0", scheme_commit="b" * 40,
+                              template_tag="v1.2.0", template_commit="a" * 40)
+    if content is not None:
+        (tmp_path / "uv.lock").write_text(content, encoding="utf-8")
+    monkeypatch.setattr(versions, "project_directory", lambda _: tmp_path)
+    session = MagicMock()
+    session.scalar.side_effect = [project, None, None]
+    with pytest.raises(HTTPException) as error:
+        versions.create_version(project.id, versions.CreateVersion(), session)
+    assert error.value.status_code == 422
+    session.add.assert_not_called()
+    session.commit.assert_not_called()
 
 
 def test_cancel_orphan_build_ignores_late_completion(submission):
@@ -119,10 +178,18 @@ def test_reconcile_finds_instance_beyond_first_page(submission):
 @pytest.mark.parametrize("kind", ["model", "optimize", "control", "execution"])
 def test_algo_submission_and_reconciliation_use_own_workflow(submission, kind):
     version, session, _, client, directory = submission
-    session.get.return_value = SimpleNamespace(kind=kind)
+    session.get.return_value.kind = kind
     path = directory / "input.json"
     data = json.loads(path.read_text())
-    data.update(kind=kind, algos={kind: data.pop("factor")},
+    component = data.pop("factor")
+    package = f"{kind}-{version.project_id.hex[:4]}"
+    component.update(package=package, entry=f"{package.replace('-', '_')}:Algo")
+    with ZipFile(component["wheel"], "w") as archive:
+        archive.writestr(f"{package}.dist-info/METADATA", f"Name: {package}\nVersion: 1.2.1\nRequires-Dist: scheme>=1.2.0,<1.3.0\n")
+        archive.writestr(package.replace("-", "_") + "/__init__.py", "")
+    component["sha256"] = hashlib.sha256(Path(component["wheel"]).read_bytes()).hexdigest()
+    (directory / "uv.lock").write_text(f'[[package]]\nname="scheme"\nversion="1.2.0"\n[[package]]\nname="{package}"\nversion="1.2.1"\nsource={{path="factor.whl"}}\n')
+    data.update(kind=kind, algos={kind: component},
                 backtest={"optimize": "risk_parity", "control": "no_control",
                           "execution": "direct_execution"})
     del data["analysis"]
@@ -137,7 +204,7 @@ def test_algo_submission_and_reconciliation_use_own_workflow(submission, kind):
 
 def test_reject_task_for_wrong_project_kind(submission):
     version, session, _, client, _ = submission
-    session.get.return_value = SimpleNamespace(kind="model")
+    session.get.return_value.kind = "model"
     with pytest.raises(HTTPException) as error:
         submit(version, session)
     assert error.value.status_code == 422

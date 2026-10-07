@@ -1,7 +1,14 @@
 """python -m core.scheduler sync/start/instances/tasks/log。"""
 
 import argparse
+import hashlib
 import json
+from pathlib import Path
+from uuid import UUID
+
+from core.apps import version_policy as policy
+from core.apps.version_policy_views import TaskCheck, check_task
+from core.database.session import database_session_factory
 
 from .client import DolphinSchedulerClient
 from .workflows import sync_workflows
@@ -26,6 +33,18 @@ def main() -> None:
     if args.command == "sync":
         result = sync_workflows()
     else:
+        if args.command == "start":
+            input_file = Path(args.input_file).resolve()
+            run_id = UUID(input_file.parent.name)
+            if input_file != (policy.run_path(run_id) / "input.json").resolve():
+                raise ValueError("CLI 只能提交对应数据库 runs/{id}/input.json")
+            # CLI has no REST admission layer; check before even logging into DS.
+            _, lockfile, _ = policy.task_files(input_file.parent, args.kind)
+            with database_session_factory()() as session:
+                check_task(run_id, TaskCheck(
+                    kind=args.kind, input_sha256=hashlib.sha256(input_file.read_bytes()).hexdigest(),
+                    lock_sha256=hashlib.sha256(lockfile.read_bytes()).hexdigest(),
+                ), session)
         with DolphinSchedulerClient() as client:
             if args.command == "start":
                 result = client.start(args.kind, args.input_file)

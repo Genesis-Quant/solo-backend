@@ -1,24 +1,31 @@
-from pathlib import Path
 import json
 import shutil
 import tempfile
+from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote, urlencode
 from uuid import UUID, uuid4
 
+from config import SoloSettings
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from config import SoloSettings
+from core.apps import version_policy as policy
 from core.database.session import get_database_session
-from .models import Project
-from .schemas import ProjectCreate, ProjectEdit, ProjectKind, ProjectRead, TemplateVersion
+
 from . import templates
 from .environment import EnvironmentError, kernel_directory, prepare_environment
-
+from .models import Project
+from .schemas import (
+    ProjectCreate,
+    ProjectEdit,
+    ProjectKind,
+    ProjectRead,
+    TemplateVersion,
+)
 
 router = APIRouter(prefix="/api/v1", tags=["projects"])
 type Database = Annotated[Session, Depends(get_database_session)]
@@ -39,12 +46,14 @@ def write_project_metadata(project: Project, directory: Path) -> None:
 def read_project(project: Project) -> ProjectRead:
     from .versions import read_version
 
+    reason = policy.project_retirement(project)
     return ProjectRead(
         id=project.id, name=project.name, description=project.description, kind=project.kind,
         schemeVersion=project.scheme_version, schemeCommit=project.scheme_commit,
         algoVersion=project.template_tag, algoCommit=project.template_commit,
         createdAt=project.created_at, updatedAt=project.updated_at, archived=project.archived,
         directory=f"projects/{project.kind}/{project.name}",
+        retired=bool(reason), retiredReason=reason,
         versions=[read_version(version) for version in project.versions],
     )
 
@@ -68,6 +77,8 @@ def scheme_versions(refresh: bool = False) -> list[TemplateVersion]:
 def template_versions(kind: ProjectKind, scheme_version: str, refresh: bool = False) -> list[TemplateVersion]:
     try:
         return templates.list_versions(kind, scheme_version, refresh)
+    except policy.VersionPolicyError as error:
+        raise HTTPException(422, error.detail) from error
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
     except templates.TemplateError as error:
@@ -94,10 +105,15 @@ def get_project(project_id: UUID, session: Database) -> ProjectRead:
 @router.post("/projects", response_model=ProjectRead, status_code=201)
 def create_project(body: ProjectCreate, session: Database) -> ProjectRead:
     try:
+        policy.require_release("scheme", tag=body.scheme_version)
+        policy.require_release("template", tag=body.algo_version)
         scheme = templates.select_scheme(body.scheme_version)
+        actual = scheme.version or templates.project_metadata(SoloSettings.SCHEME_REPOSITORY, scheme.commit, "pyproject.toml")["version"]
+        policy.require_release("scheme", tag=scheme.tag, commit=scheme.commit, version=actual)
         version = next((v for v in templates.list_versions(body.kind, body.scheme_version) if v.tag == body.algo_version), None)
         if version is None:
             raise HTTPException(422, "Algo 版本不存在或不兼容所选 scheme，请刷新版本列表")
+        policy.require_release("template", tag=version.tag, commit=version.commit, version=version.version)
         used_suffixes = {identifier.hex[:4] for identifier in session.scalars(
             select(Project.id).where(Project.kind == body.kind)
         )}
@@ -132,6 +148,8 @@ def create_project(body: ProjectCreate, session: Database) -> ProjectRead:
         return read_project(project)
     except templates.TemplateError as error:
         raise HTTPException(502, str(error)) from error
+    except policy.VersionPolicyError as error:
+        raise HTTPException(422, error.detail) from error
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
     except EnvironmentError as error:
@@ -149,6 +167,10 @@ def edit_project(project_id: UUID, body: ProjectEdit, session: Database) -> Proj
         project.description = body.description
         session.commit()
         return read_project(project)
+    try:
+        policy.require_project(project)
+    except policy.VersionPolicyError as error:
+        raise HTTPException(422, error.detail) from error
     source = project_directory(project)
     destination = source.with_name(body.name)
     if destination.exists() or session.scalar(select(Project.id).where(Project.kind == project.kind, Project.name == body.name)):

@@ -3,7 +3,6 @@
 import re
 import stat
 import subprocess
-import tomllib
 from base64 import b64decode
 from functools import lru_cache
 from io import BytesIO
@@ -15,10 +14,12 @@ from zipfile import BadZipFile, ZipFile
 
 import requests
 import tomlkit
+import tomllib
+from config import SoloSettings
 from packaging.requirements import Requirement
 from packaging.version import Version
 
-from config import SoloSettings
+from core.apps import version_policy as policy
 
 from .schemas import ProjectKind, TemplateVersion
 
@@ -78,36 +79,50 @@ def project_metadata(repository: str, commit: str, path: str) -> dict:
 
 
 def list_scheme_versions(refresh: bool = False) -> list[TemplateVersion]:
-    return [release.model_copy(update={
-        "version": project_metadata(SoloSettings.SCHEME_REPOSITORY, release.commit, "pyproject.toml")["version"],
-    }) for release in repository_versions(SoloSettings.SCHEME_REPOSITORY, refresh)]
+    result = []
+    for release in repository_versions(SoloSettings.SCHEME_REPOSITORY, refresh):
+        # Known retired identities need no additional remote metadata request.
+        if policy.release_reason("scheme", tag=release.tag, commit=release.commit):
+            continue
+        actual = project_metadata(SoloSettings.SCHEME_REPOSITORY, release.commit, "pyproject.toml")["version"]
+        try:
+            policy.require_release("scheme", tag=release.tag, commit=release.commit, version=actual)
+        except policy.VersionPolicyError:
+            continue
+        result.append(release.model_copy(update={"version": actual}))
+    return result
 
 
 def select_scheme(tag: str) -> TemplateVersion:
+    policy.require_release("scheme", tag=tag)
     selected = next((v for v in list_scheme_versions() if v.tag == tag), None)
     if selected is None:
-        raise ValueError("scheme 版本不存在，请刷新版本列表")
+        raise ValueError("scheme 版本不存在或已退役，请刷新版本列表")
+    policy.require_release("scheme", tag=selected.tag, commit=selected.commit, version=selected.version)
     return selected
 
 
 def validate_template(project: dict, scheme: Version) -> None:
-    """模板保留同主版本的最低正式版本下界，并兼容实际选定的 Scheme。"""
-    if Version(project.get("version", "")).major != scheme.major:
-        raise ValueError("模板主版本必须与 scheme 一致")
+    """模板主、次版本与 Scheme 一致，依赖允许该系列的任意 patch。"""
+    version = Version(project.get("version", ""))
+    if not all(re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,2}", str(value)) for value in (version, scheme)):
+        raise ValueError("模板与 scheme 必须使用正式版本（主、次版本一致，patch 任意）")
+    if (version.major, version.minor) != (scheme.major, scheme.minor):
+        raise ValueError("模板主、次版本必须与 scheme 一致")
     requirements = [(text, Requirement(text)) for text in project.get("dependencies", [])]
     scheme_requirements = [(text, r) for text, r in requirements if r.name.lower() == "scheme"]
-    message = f"模板必须声明兼容 scheme 的唯一范围：>=X.Y.Z,<{scheme.major + 1}.0.0（X={scheme.major}，无 URL、marker、extras）"
+    minimum = Version(f"{scheme.major}.{scheme.minor}.0")
+    maximum = Version(f"{scheme.major}.{scheme.minor + 1}.0")
+    message = f"模板必须声明同一 scheme 主、次版本的唯一完整 patch 范围：>={minimum},<{maximum}（无 URL、marker、extras）"
     if len(scheme_requirements) != 1:
         raise ValueError(message)
     text, requirement = scheme_requirements[0]
     bounds = {specifier.operator: specifier.version for specifier in requirement.specifier}
-    minimum = bounds.get(">=", "")
     # SpecifierSet 会去重；原始声明也只能包含两个边界。
     if (requirement.url or requirement.marker or requirement.extras or text.count(",") != 1
             or len(requirement.specifier) != 2 or set(bounds) != {">=", "<"}
             or not all(re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,2}", value) for value in bounds.values())
-            or Version(minimum).major != scheme.major
-            or Version(bounds["<"]) != Version(f"{scheme.major + 1}.0.0")):
+            or Version(bounds[">="]) != minimum or Version(bounds["<"]) != maximum):
         raise ValueError(message)
     if scheme not in requirement.specifier:
         raise ValueError(f"所选 scheme {scheme} 不满足模板依赖：{requirement}")
@@ -115,11 +130,16 @@ def validate_template(project: dict, scheme: Version) -> None:
 
 def list_versions(kind: ProjectKind, scheme_version: str, refresh: bool = False) -> list[TemplateVersion]:
     selected = select_scheme(scheme_version)
-    scheme = Version(project_metadata(SoloSettings.SCHEME_REPOSITORY, selected.commit, "pyproject.toml")["version"])
+    actual = selected.version or project_metadata(SoloSettings.SCHEME_REPOSITORY, selected.commit, "pyproject.toml")["version"]
+    policy.require_release("scheme", tag=selected.tag, commit=selected.commit, version=actual)
+    scheme = Version(actual)
     result = []
     for release in repository_versions(SoloSettings.TEMPLATE_REPOSITORY, refresh):
+        if policy.release_reason("template", tag=release.tag, commit=release.commit):
+            continue
         project = project_metadata(SoloSettings.TEMPLATE_REPOSITORY, release.commit, f"{kind}/pyproject.toml")
         try:
+            policy.require_release("template", tag=release.tag, commit=release.commit, version=project["version"])
             validate_template(project, scheme)
         except ValueError:
             continue
@@ -129,9 +149,13 @@ def list_versions(kind: ProjectKind, scheme_version: str, refresh: bool = False)
 
 def pin_scheme(directory: Path, selected: TemplateVersion) -> None:
     """保留模板依赖范围；验证兼容后仅用 uv source 固定实际 commit。"""
-    version = Version(project_metadata(SoloSettings.SCHEME_REPOSITORY, selected.commit, "pyproject.toml")["version"])
+    policy.require_release("scheme", tag=selected.tag, commit=selected.commit, version=selected.version)
+    actual = selected.version or project_metadata(SoloSettings.SCHEME_REPOSITORY, selected.commit, "pyproject.toml")["version"]
+    policy.require_release("scheme", tag=selected.tag, commit=selected.commit, version=actual)
+    version = Version(actual)
     path = directory / "pyproject.toml"
     document = tomlkit.parse(path.read_text(encoding="utf-8"))
+    policy.require_release("template", version=str(document["project"]["version"]))
     validate_template(document["project"], version)
     sources = document.setdefault("tool", {}).setdefault("uv", {}).setdefault("sources", {})
     sources["scheme"] = {"git": f"https://gitee.com/{SoloSettings.SCHEME_REPOSITORY}", "rev": selected.commit}

@@ -65,6 +65,27 @@ def _project_parameters(model: type[BaseModel], source: BaseModel) -> BaseModel:
     return model.model_validate(SimpleNamespace(**values), from_attributes=True)
 
 
+def _form_schema(model: type[BaseModel]) -> tuple[dict, dict[str, str]]:
+    """Map canonical business fields to the flat validation schema's wire keys."""
+    by_alias = model.model_config.get("validate_by_alias") is not False
+    schema = model.model_json_schema(by_alias=by_alias, mode="validation")
+    properties = schema.get("properties", {})
+    wire = {}
+    for name, field in model.model_fields.items():
+        alias = field.validation_alias if by_alias else None
+        if isinstance(alias, AliasChoices):
+            alias = next((choice for choice in alias.choices if isinstance(choice, str)), None)
+            if alias is None:
+                raise ValueError(f"Form 字段 {name!r} 的 AliasPath 不支持扁平表单 JSON（unsupported）")
+        if isinstance(alias, AliasPath):
+            raise ValueError(f"Form 字段 {name!r} 的 AliasPath 不支持扁平表单 JSON（unsupported）")
+        key = alias if isinstance(alias, str) else name
+        if key not in properties or key in wire.values():
+            raise ValueError(f"Form 字段 {name!r} 无法唯一对应 schema wire key {key!r}（unsupported）")
+        wire[name] = key
+    return schema, wire
+
+
 def inspect(data: dict) -> dict:
     from scheme.execute.strategy.assembly import parameter_type
 
@@ -81,32 +102,36 @@ def inspect(data: dict) -> dict:
     names = set(form.model_fields) - STAGES
     if kind != "model":
         names -= COMMON
+    schema, wire = _form_schema(form)
+    published = {wire[name] for name in names}
     if "values" not in data:
-        schema = form.model_json_schema()
-        schema["properties"] = {key: value for key, value in schema["properties"].items() if key in names}
-        schema["required"] = [name for name in schema.get("required", []) if name in names]
+        schema["properties"] = {key: value for key, value in schema["properties"].items() if key in published}
+        schema["required"] = [key for key in schema.get("required", []) if key in published]
         values = {
-            name: TypeAdapter(field.annotation).dump_python(field.get_default(call_default_factory=True), mode="json")
+            wire[name]: TypeAdapter(field.annotation).dump_python(field.get_default(call_default_factory=True), mode="json")
             for name, field in form.model_fields.items() if name in names and not field.is_required()
         }
         saved = data.get("saved", {})
-        values.update({key: value for key, value in saved.items() if key in names})
+        values.update({wire[name]: value for name, value in saved.items() if name in names})
         if kind == "model":
-            values.update({key: value for key, value in saved.get("config", {}).items() if key in names})
-            if saved.get("universe", {}).get("pool"):
-                values["pool"] = saved["universe"]["pool"]
-            if "lookback" in saved.get("universe", {}):
-                values["lookback"] = saved["universe"]["lookback"]
+            values.update({wire[name]: value for name, value in saved.get("config", {}).items() if name in names})
+            if "pool" in names and saved.get("universe", {}).get("pool"):
+                values[wire["pool"]] = saved["universe"]["pool"]
+            if "lookback" in names and "lookback" in saved.get("universe", {}):
+                values[wire["lookback"]] = saved["universe"]["lookback"]
         return {"schema": schema, "values": values}
-    unknown = set(data["values"]) - names
+    unknown = set(data["values"]) - published
     if unknown:
         raise ValueError(f"{kind} Form 包含未声明字段：{sorted(unknown)}")
-    values = {**data.get("common", {}), **data["values"]}
     if data.get("entry"):
-        values = {key: value for key, value in values.items() if key in form.model_fields}
+        values = {
+            wire[name]: value for name, value in data.get("common", {}).items()
+            if name in COMMON and name in wire
+        }
+        values.update(data["values"])
         for name, field in form.model_fields.items():
             if (field.json_schema_extra or {}).get("x-algo-kind"):
-                values[name] = data["entries"].get(name) or f"default:{name}"
+                values[wire[name]] = data["entries"].get(name) or f"default:{name}"
         built = form.model_validate(values).build()
         # 该脚本也在旧 Scheme 的隔离环境中运行，不依赖新增的投影辅助函数。
         params = _project_parameters(parameter_type(algo), built)

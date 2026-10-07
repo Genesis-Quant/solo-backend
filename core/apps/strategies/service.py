@@ -3,16 +3,17 @@ import json
 import os
 import shutil
 import subprocess
-import tomllib
 from pathlib import Path
 from uuid import UUID
 
 import tomlkit
+import tomllib
+from config import SoloSettings
 from fastapi import HTTPException
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
-from config import SoloSettings
+from core.apps import version_policy as policy
 from core.apps.projects.models import Project, ProjectVersion
 from core.apps.projects.versions import version_directory
 
@@ -60,20 +61,51 @@ def selected(session, selections: dict[str, UUID | None]) -> dict:
         project = session.get(Project, version.project_id) if version else None
         if not project or project.kind != kind or project.archived or version.status != "success":
             raise HTTPException(422, f"{kind} 必须选择对应类型的成功研究版本")
+        try:
+            policy.check_task(session, version, project=project, directory=version_directory(version), kind=kind)
+        except policy.VersionPolicyError as error:
+            raise HTTPException(422, error.detail) from error
         source = json.loads((version_directory(version) / "input.json").read_text())
         component = source["algos"][kind]
         result[kind] = {"label": f"{project.name} · v{version.number}", "project_id": str(project.id),
                         "version_id": str(version.id), "scheme_version": version.scheme_version,
+                        "root_sources": policy.project_sources(project),
                         "component": component, "input": source}
-    major = Version(result["model"]["scheme_version"]).major
-    if major != 1:
+    scheme = Version(result["model"]["scheme_version"])
+    if scheme.major != 1:
         raise HTTPException(422, "当前策略组装支持 Scheme 1.x")
-    if any(item["version_id"] and Version(item["scheme_version"]).major != major for item in result.values()):
-        raise HTTPException(422, "各环节必须使用同一 Scheme 大版本")
+    for item in result.values():
+        if item["version_id"]:
+            version = Version(item["scheme_version"])
+            if (version.major, version.minor) != (scheme.major, scheme.minor):
+                raise HTTPException(422, "各环节必须使用同一 Scheme 主、次版本")
     return result
 
 
+def require_components(components: dict) -> None:
+    """Guard direct form/build calls too, using each result's own frozen environment."""
+    series = None
+    for item in components.values():
+        if not item["version_id"]:
+            continue
+        reason = policy.source_reason(item.get("root_sources", {}))
+        if reason:
+            raise policy.VersionPolicyError(reason)
+        policy.require_release("scheme", version=item["scheme_version"])
+        environment = Path(item["input"]["environment"]["lockfile"])
+        lock = tomllib.loads(environment.read_text(encoding="utf-8"))
+        actual = policy.require_locked_scheme(lock)
+        if actual != policy.formal_version(item["scheme_version"]):
+            raise ValueError("成果 ActualScheme 与其冻结锁文件不一致")
+        policy.require_result_series(item["component"]["version"], actual)
+        current = (actual.major, actual.minor)
+        if series is not None and current != series:
+            raise ValueError("各环节必须使用同一 Scheme 主、次版本")
+        series = current
+
+
 def inspect_component(components: dict, kind: str, values: dict | None = None, common: dict | None = None) -> dict:
+    require_components(components)
     item = components[kind]
     source = item if item["version_id"] else components["model"]
     environment = Path(source["input"]["environment"]["lockfile"]).parent
@@ -87,6 +119,7 @@ def inspect_component(components: dict, kind: str, values: dict | None = None, c
 
 
 def build(components: dict, forms: dict, destination: Path) -> str:
+    require_components(components)
     common = forms["model"]
     inspected = {kind: inspect_component(components, kind, forms[kind], common) for kind in KINDS}
     backtest = inspected["model"]["backtest"]
@@ -165,6 +198,9 @@ def build(components: dict, forms: dict, destination: Path) -> str:
                         "constraint-dependencies": list(sources)}},
     }))
     command(["uv", "lock", "--project", str(environment)], environment)
+    frozen = policy.require_locked_scheme(tomllib.loads((environment / "uv.lock").read_text(encoding="utf-8")))
+    if frozen != policy.formal_version(scheme_version):
+        raise ValueError("策略冻结环境改变了所选 Model 的 ActualScheme")
     data = {"kind": "strategy", "environment": {"lockfile": str(environment / "uv.lock")},
             "algos": algos, "backtest": backtest, "output": str(destination / "report")}
     (destination / "input.json").write_text(json.dumps(data, ensure_ascii=False, indent=2))

@@ -1,19 +1,26 @@
+import hashlib
 from datetime import UTC, datetime
-from uuid import UUID
 from typing import Annotated, Literal
+from uuid import UUID
 
+from config import SoloSettings
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
-from config import SoloSettings
-from core.apps.projects.versions import refresh_version, workflow_tasks, workflow_logs, download_workflow_log
+from core.apps import version_policy as policy
+from core.apps.projects.versions import (
+    download_workflow_log,
+    refresh_version,
+    workflow_logs,
+    workflow_tasks,
+)
 from core.apps.projects.views import Database
 from core.scheduler.client import DolphinSchedulerClient, DolphinSchedulerError
 
 from .models import Strategy
-from .service import KINDS, build, inspect_component, selected
+from .service import KINDS, build, inspect_component, require_components, selected
 
 router = APIRouter(prefix="/api/v1/strategies", tags=["strategies"])
 
@@ -33,7 +40,9 @@ class CreateStrategy(BaseModel):
 
 
 def read(strategy: Strategy) -> dict:
+    reason = policy.version_retirement(strategy)
     return {"id": str(strategy.id), "name": strategy.name, "components": strategy.components,
+            "retired": bool(reason), "retiredReason": reason,
             "forms": strategy.forms, "status": strategy.status, "error": strategy.error,
             "workflowId": strategy.workflow_id, "schemeVersion": strategy.scheme_version,
             "createdAt": strategy.created_at.isoformat(),
@@ -55,7 +64,9 @@ def forms(body: Selection, session: Database) -> dict:
     try:
         components = selected(session, body.model_dump())
         return {kind: inspect_component(components, kind) for kind in KINDS}
-    except (ValueError, OSError) as error:
+    except policy.VersionPolicyError as error:
+        raise HTTPException(422, error.detail) from error
+    except (ValueError, OSError, KeyError, TypeError) as error:
         raise HTTPException(422, str(error)) from error
 
 
@@ -65,6 +76,7 @@ def create_strategy(body: CreateStrategy, session: Database) -> dict:
         raise HTTPException(422, "请填写策略名称和全部环节的 Form")
     try:
         components = selected(session, body.selections.model_dump())
+        require_components(components)
         strategy = Strategy(name=body.name.strip(), forms=body.forms, components={
             kind: {key: value for key, value in item.items() if key not in {"component", "input"}}
             for kind, item in components.items()
@@ -74,6 +86,10 @@ def create_strategy(body: CreateStrategy, session: Database) -> dict:
         directory = SoloSettings.SHARED_DIR / "runs" / str(strategy.id)
         try:
             strategy.scheme_version = build(components, body.forms, directory)
+            policy.check_task(session, strategy, kind="strategy", directory=directory)
+            _, lockfile, _ = policy.task_files(directory, "strategy")
+            strategy.input_sha256 = hashlib.sha256((directory / "input.json").read_bytes()).hexdigest()
+            strategy.lock_sha256 = hashlib.sha256(lockfile.read_bytes()).hexdigest()
             strategy.status = "queued"
             session.commit()
             with DolphinSchedulerClient() as client:
@@ -86,7 +102,9 @@ def create_strategy(body: CreateStrategy, session: Database) -> dict:
                 strategy.finished_at = datetime.now(UTC)
         session.commit()
         return read(strategy)
-    except (ValueError, OSError) as error:
+    except policy.VersionPolicyError as error:
+        raise HTTPException(422, error.detail) from error
+    except (ValueError, OSError, KeyError, TypeError) as error:
         raise HTTPException(422, str(error)) from error
 
 
