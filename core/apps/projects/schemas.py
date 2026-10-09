@@ -37,6 +37,8 @@ class ProjectRead(BaseModel):
     name: str
     description: str
     kind: ProjectKind
+    packageName: str | None = None
+    artifactDependencies: dict[str, dict] = Field(default_factory=dict)
     schemeVersion: str | None
     schemeCommit: str | None
     algoVersion: str

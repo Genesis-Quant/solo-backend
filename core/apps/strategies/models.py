@@ -1,10 +1,10 @@
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import JSON, DateTime, Integer, String, Text, Uuid
+from sqlalchemy import JSON, DateTime, Integer, String, Text, Uuid, event
 from sqlalchemy.orm import Mapped, mapped_column
 
-from core.apps.projects.models import utc_now
+from core.apps.projects.models import immutable_accepted_artifacts, utc_now
 from core.database.base import Base
 
 
@@ -19,7 +19,13 @@ class Strategy(Base):
     workflow_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     input_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     lock_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    accepted_artifacts: Mapped[dict | None] = mapped_column(JSON, default=dict, nullable=True, comment="独立策略的冻结 artifact 接受快照；旧记录允许 NULL")
     scheme_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+@event.listens_for(Strategy, "before_update")
+def immutable_strategy_artifacts(mapper, connection, record) -> None:
+    immutable_accepted_artifacts(mapper, connection, record)

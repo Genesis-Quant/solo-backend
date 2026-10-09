@@ -19,7 +19,7 @@ from core.apps import version_policy as policy
 from core.scheduler.client import DolphinSchedulerClient, DolphinSchedulerError
 from core.scheduler.task_logs import worker_task_log_page
 
-from .models import Project, ProjectVersion
+from .models import Project, ProjectDeletion, ProjectVersion
 from .views import Database, get_project_or_404, project_directory
 
 router = APIRouter(prefix="/api/v1/projects", tags=["versions"])
@@ -96,12 +96,31 @@ def refresh_version(version: ProjectVersion, *, workflow_kind: str | None = None
 def read_version(version: ProjectVersion) -> dict:
     seconds = int(((version.finished_at or datetime.now(UTC)) - version.created_at).total_seconds())
     reason = policy.version_retirement(version)
+    from sqlalchemy.orm import object_session
+    from core.apps.artifacts.models import ResearchArtifact
+    from core.apps.artifacts.service import read_artifact
+
+    artifact = None
+    session = object_session(version)
+    snapshots = policy.snapshot_values(getattr(version, "accepted_artifacts", None))
+    for snapshot in snapshots.values():
+        if (snapshot.get("origin_project_id") != str(version.project_id)
+                or snapshot.get("version") != version.package_version):
+            continue
+        if session is not None and snapshot.get("id"):
+            artifact = session.get(ResearchArtifact, UUID(snapshot["id"]))
+        break
+    artifact_data = read_artifact(artifact) if artifact is not None else None
     return {
         "id": str(version.id), "number": version.number, "packageVersion": version.package_version,
         "retired": bool(reason), "retiredReason": reason,
         "note": version.note, "submittedAt": version.created_at.isoformat(),
         "status": "failed" if version.status == "submit_failed" else version.status if version.status in {"success", "failed"} else "running",
-        "phase": version.status, "publishStatus": "unpublished", "workflowId": version.workflow_id or 0,
+        "phase": version.status, "publishStatus": "published" if artifact is not None and artifact.published_at else "unpublished",
+        "artifactId": str(artifact.id) if artifact is not None else None, "artifact": artifact_data,
+        "files": ([{"name": artifact.filename, "size": artifact.size_bytes,
+                    "url": f"/api/v1/artifacts/{artifact.id}/wheel"}] if artifact is not None else []),
+        "workflowId": version.workflow_id or 0,
         "duration": f"{seconds}s", "error": version.error,
         "reportPath": f"{version.id}/report" if version.status == "success" else None,
         "parameters": {k: json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v for k, v in version.parameters.items()},
@@ -132,6 +151,8 @@ def create_version(project_id: UUID, body: CreateVersion, session: Database) -> 
     project = session.scalar(select(Project).where(Project.id == project_id).with_for_update())
     if project is None or project.archived:
         raise HTTPException(404, "项目不存在")
+    if session.get(ProjectDeletion, project_id) is not None:
+        raise HTTPException(409, "项目正在删除，不能保存新的研究版本")
     try:
         reason = policy.source_reason(policy.project_sources(project))
         if reason:
@@ -174,6 +195,8 @@ def submit_version(project_id: UUID, version_id: UUID, body: BuildResult, sessio
         session.commit()
         return read_version(version)
     project = get_project_or_404(session, project_id)
+    if session.get(ProjectDeletion, project_id) is not None:
+        raise HTTPException(409, "项目正在删除，不能提交研究任务")
     try:
         reason = policy.source_reason(policy.project_sources(project)) or (
             policy.release_reason("scheme", version=version.scheme_version) if version.scheme_version else None
@@ -186,6 +209,10 @@ def submit_version(project_id: UUID, version_id: UUID, body: BuildResult, sessio
     try:
         project = get_project_or_404(session, project_id)
         kind = project.kind
+        if not version.accepted_artifacts:
+            version.accepted_artifacts = policy.capture_task_artifacts(
+                session, version, project=project, directory=directory, kind=kind,
+            )
         policy.check_task(session, version, project=project, directory=directory, kind=kind)
         data = json.loads((directory / "input.json").read_text())
         if data["kind"] != kind:

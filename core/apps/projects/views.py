@@ -7,7 +7,7 @@ from typing import Annotated
 from urllib.parse import quote, urlencode
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -18,6 +18,7 @@ from core.apps import version_policy as policy
 from core.database.session import get_database_session
 
 from . import templates
+from .deletion import delete_project, project_lifecycle_guard
 from .environment import EnvironmentError, kernel_directory, prepare_environment
 from .models import Project
 from .schemas import (
@@ -42,6 +43,7 @@ def write_project_metadata(project: Project, directory: Path) -> None:
         "scheme_version": project.scheme_version, "scheme_commit": project.scheme_commit,
         "algo_version": project.template_tag, "algo_commit": project.template_commit,
         "template_package_version": project.template_package_version,
+        "package_name": project.package_name,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -51,6 +53,7 @@ def read_project(project: Project) -> ProjectRead:
     reason = policy.project_retirement(project)
     return ProjectRead(
         id=project.id, name=project.name, description=project.description, kind=project.kind,
+        packageName=project.package_name, artifactDependencies=project.artifact_dependencies or {},
         schemeVersion=project.scheme_version, schemeCommit=project.scheme_commit,
         algoVersion=project.template_tag, algoCommit=project.template_commit,
         createdAt=project.created_at, updatedAt=project.updated_at, archived=project.archived,
@@ -60,11 +63,19 @@ def read_project(project: Project) -> ProjectRead:
     )
 
 
-def get_project_or_404(session: Session, project_id: UUID) -> Project:
-    project = session.get(Project, project_id)
+def get_project_or_404(session: Session, project_id: UUID, *, populate_existing: bool = False) -> Project:
+    project = (session.get(Project, project_id, populate_existing=True) if populate_existing
+               else session.get(Project, project_id))
     if project is None or project.archived:
         raise HTTPException(404, "项目不存在")
     return project
+
+
+def require_not_deleting(session: Session, project_id: UUID) -> None:
+    from .models import ProjectDeletion
+
+    if session.get(ProjectDeletion, project_id, populate_existing=True) is not None:
+        raise HTTPException(409, "项目正在删除或等待资源清理，请按原项目 ID 重试删除")
 
 
 @router.get("/templates/scheme-versions", response_model=list[TemplateVersion])
@@ -121,23 +132,31 @@ def create_project(body: ProjectCreate, session: Database) -> ProjectRead:
             SoloSettings.TEMPLATE_REPOSITORY, version.commit, f"{body.kind}/pyproject.toml",
         )["version"]
         policy.require_release("template", tag=version.tag, commit=version.commit, version=template_actual)
-        used_suffixes = {identifier.hex[:4] for identifier in session.scalars(
-            select(Project.id).where(Project.kind == body.kind)
-        )}
-        if len(used_suffixes) >= 16 ** 4:
+        from core.apps.artifacts.models import ResearchArtifact
+        from .models import ProjectDeletion
+
+        if session.scalar(select(Project.id).where(Project.kind == body.kind, Project.name == body.name)):
+            raise HTTPException(409, "该类型下已有同名项目")
+        used_packages = set(session.scalars(select(Project.package_name)))
+        used_packages.update(session.scalars(select(ResearchArtifact.package_name)))
+        if sum(f"{body.kind}-{suffix:04x}" in used_packages for suffix in range(16 ** 4)) == 16 ** 4:
             raise HTTPException(409, "该项目类型的 4 位包名已用完")
-        project_id = uuid4()
-        while project_id.hex[:4] in used_suffixes:
+        for _ in range(16 ** 4):
             project_id = uuid4()
+            package_name = f"{body.kind}-{project_id.hex[:4]}"
+            if (package_name not in used_packages and session.get(Project, project_id) is None
+                    and session.get(ProjectDeletion, project_id) is None):
+                break
+        else:
+            raise HTTPException(503, "无法分配新的项目包名，请稍后重试")
         project = Project(id=project_id, name=body.name, description=body.description, kind=body.kind,
+                          package_name=package_name,
                           template_tag=version.tag, template_commit=version.commit,
                           template_package_version=template_actual,
                           scheme_version=scheme.tag, scheme_commit=scheme.commit)
-        if session.scalar(select(Project.id).where(Project.kind == body.kind, Project.name == body.name)):
-            raise HTTPException(409, "该类型下已有同名项目（包含已删除保留的项目）")
         destination = project_directory(project)
-        if destination.exists():
-            raise HTTPException(409, "同名目录已存在，请使用其他项目名称")
+        if destination.exists() or destination.is_symlink() or destination.is_junction():
+            raise HTTPException(409, "同名目录已存在（可能是删除时保留的工作区），请移走该目录或使用其他项目名称")
         destination.mkdir(parents=True, exist_ok=False)
         try:
             templates.create_directory(body.kind, version.commit, destination, project.id.hex[:4])
@@ -173,11 +192,29 @@ def create_project(body: ProjectCreate, session: Database) -> ProjectRead:
 
 @router.patch("/projects/{project_id}", response_model=ProjectRead)
 def edit_project(project_id: UUID, body: ProjectEdit, session: Database) -> ProjectRead:
-    project = get_project_or_404(session, project_id)
+    # Acquire before journal/project reads, and retain through rollback and backup cleanup.
+    with project_lifecycle_guard(project_id, session):
+        try:
+            return _edit_project(project_id, body, session)
+        except Exception:
+            session.rollback()
+            raise
+
+
+def _edit_project(project_id: UUID, body: ProjectEdit, session: Session) -> ProjectRead:
+    require_not_deleting(session, project_id)
+    project = get_project_or_404(session, project_id, populate_existing=True)
     if project.name == body.name:
         project.description = body.description
         session.commit()
         return read_project(project)
+    from core.apps.artifacts.service import ArtifactError, require_settled_installations
+
+    try:
+        # Do not invalidate an accepted install's exact workspace recovery bytes/paths.
+        require_settled_installations(session, project_id)
+    except ArtifactError as error:
+        raise HTTPException(409, error.detail) from error
     source = project_directory(project)
     try:
         original_lock = (source / "uv.lock").read_bytes()
@@ -239,15 +276,17 @@ def edit_project(project_id: UUID, body: ProjectEdit, session: Database) -> Proj
 
 
 @router.delete("/projects/{project_id}", status_code=204)
-def archive_project(project_id: UUID, session: Database) -> Response:
-    project = get_project_or_404(session, project_id)
-    project.archived = True
-    session.commit()
+def remove_project(
+    project_id: UUID, session: Database,
+    delete_files: Annotated[bool, Query(description="删除项目工作区；false 仅保留工作区文件夹，任务与 Kernel 注册仍删除")] = True,
+) -> Response:
+    delete_project(project_id, session, delete_files=delete_files)
     return Response(status_code=204)
 
 
 @router.get("/projects/{project_id}/jupyter")
 def open_jupyter(project_id: UUID, session: Database) -> RedirectResponse:
+    require_not_deleting(session, project_id)
     project = get_project_or_404(session, project_id)
     if not project_directory(project).is_dir():
         raise HTTPException(409, "项目目录不存在，请检查共享卷挂载")

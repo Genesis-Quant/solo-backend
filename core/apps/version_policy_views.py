@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from core.apps import version_policy as policy
-from core.apps.projects.models import Project, ProjectVersion
+from core.apps.projects.models import Project, ProjectDeletion, ProjectVersion
 from core.apps.strategies.models import Strategy
 from core.database.session import get_database_session
 
@@ -34,7 +34,9 @@ def check_project(project_id: UUID, session: Database) -> dict:
     if project is None:
         raise HTTPException(404, "项目不存在")
     if project.archived:
-        raise HTTPException(422, {"code": "project_archived", "reason": "归档项目仅允许读取历史"})
+        raise HTTPException(422, {"code": "project_archived", "reason": "旧归档项目待清理，不能用于新研究"})
+    if session.get(ProjectDeletion, project_id) is not None:
+        raise HTTPException(409, {"code": "project_deleting", "reason": "项目正在删除"})
     try:
         policy.require_project(project)
     except policy.VersionPolicyError as error:
@@ -62,4 +64,5 @@ def check_task(run_id: UUID, body: TaskCheck, session: Database) -> dict:
         raise HTTPException(422, error.detail) from error
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise HTTPException(422, {"code": "task_identity_mismatch", "reason": str(error)}) from error
-    return {"allowed": True, "grandfathered": grandfathered}
+    return {"allowed": True, "grandfathered": grandfathered,
+            "artifacts": policy.accepted_runtime_artifacts(record, policy.run_path(run_id), body.kind)}

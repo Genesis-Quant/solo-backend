@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from config import SoloSettings
+from core.utils.uv import uv_environment
 
 
 class EnvironmentError(Exception):
@@ -22,8 +23,7 @@ def prepare_environment(directory: Path, project_id: str, name: str, *, locked: 
         "UV_PROJECT_ENVIRONMENT": str(directory / ".venv"),
         "UV_PYTHON_INSTALL_DIR": str(SoloSettings.HOME_DIR / ".python"),
         "UV_PYTHON_BIN_DIR": "/tmp/solo-python-bin",
-        "UV_CACHE_DIR": "/tmp/solo-uv-cache",
-        "UV_LINK_MODE": "copy",
+        **uv_environment(directory),
         "GIT_TERMINAL_PROMPT": "0",
     }
     try:

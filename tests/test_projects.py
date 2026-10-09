@@ -5,20 +5,21 @@ import subprocess
 import tomllib
 from io import BytesIO
 from pathlib import Path
-from uuid import UUID
+from types import SimpleNamespace
+from uuid import UUID, uuid4
 from zipfile import ZipFile
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
-from sqlalchemy.pool import StaticPool
 
 from config import SoloSettings
 from core.apps import version_policy as policy
-from core.apps.projects import templates, views
+from core.apps.projects import deletion, templates, views
 from core.apps.projects.environment import EnvironmentError, kernel_directory
-from core.apps.projects.models import Project
+from core.apps.projects.models import Project, ProjectDeletion, ProjectVersion
+from core.apps.strategies.models import Strategy
 from core.apps.projects.schemas import TemplateVersion
 from core.database.base import Base
 from core.database.session import get_database_session
@@ -41,11 +42,19 @@ def archive_content(kind: str, extra: str | None = None) -> bytes:
 
 @pytest.fixture
 def projects_client(tmp_path: Path, monkeypatch):
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    # File-backed SQLite gives concurrent request sessions independent connections.
+    engine = create_engine(f"sqlite:///{(tmp_path / 'projects.sqlite3').as_posix()}",
+                           connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     monkeypatch.setattr(SoloSettings, "SHARED_DIR", tmp_path)
     monkeypatch.setattr(SoloSettings, "HOME_DIR", tmp_path / "home")
     monkeypatch.setattr(SoloSettings, "JUPYTER_TOKEN", "")
+
+    def jupyter(path, headers, *, params=None, method="GET", body=None):
+        payload = {"project_id": body["project_id"], "lease": body["lease"]} if method == "POST" else []
+        return SimpleNamespace(status_code=204 if method == "DELETE" else 200, json=lambda: payload)
+
+    monkeypatch.setattr(deletion, "jupyter_request", jupyter)
     monkeypatch.setattr(templates, "list_versions", lambda kind, scheme_version, refresh=False: [TemplateVersion(tag="v1.2.0", commit="a" * 40)])
     monkeypatch.setattr(templates, "list_scheme_versions", lambda refresh=False: [TemplateVersion(tag="v1.2.0", commit="b" * 40)])
     monkeypatch.setattr(templates, "project_metadata", lambda *args: {"version": "1.2.0"})
@@ -57,7 +66,9 @@ def projects_client(tmp_path: Path, monkeypatch):
             (directory / "uv.lock").write_text('[[package]]\nname="scheme"\nversion="1.2.0"\n')
         kernel = kernel_directory(project_id)
         kernel.mkdir(parents=True, exist_ok=True)
-        (kernel / "kernel.json").write_text(json.dumps({"display_name": name}))
+        (kernel / "kernel.json").write_text(json.dumps({
+            "display_name": name, "argv": [str(directory / ".venv" / "bin" / "python")],
+        }))
 
     monkeypatch.setattr(views, "prepare_environment", prepare)
 
@@ -82,7 +93,7 @@ def test_create_read_rename_archive(projects_client, kind):
     project = response.json()
     directory = root / "projects" / kind / "测试 项目"
     metadata = json.loads((directory / ".solo").read_text(encoding="utf-8"))
-    assert metadata == {"project_id": project["id"], "name": "测试 项目", "kind": kind, "scheme_version": "v1.2.0", "scheme_commit": "b" * 40, "algo_version": "v1.2.0", "algo_commit": "a" * 40, "template_package_version": "1.2.0"}
+    assert metadata == {"project_id": project["id"], "name": "测试 项目", "kind": kind, "scheme_version": "v1.2.0", "scheme_commit": "b" * 40, "algo_version": "v1.2.0", "algo_commit": "a" * 40, "template_package_version": "1.2.0", "package_name": project["packageName"]}
     assert project["directory"] == f"projects/{kind}/测试 项目"
     assert project["schemeVersion"] == "v1.2.0"
     assert project["schemeCommit"] == "b" * 40
@@ -112,8 +123,408 @@ def test_create_read_rename_archive(projects_client, kind):
     assert client.delete(url).status_code == 204
     assert client.get("/api/v1/projects").json() == []
     assert client.get(url).status_code == 404
-    assert renamed.is_dir()
-    assert client.post("/api/v1/projects", json={"name": "新名字", "kind": kind, "scheme_version": "v1.2.0", "algo_version": "v1.2.0"}).status_code == 409
+    assert not renamed.exists()
+    assert not kernel_directory(project["id"]).exists()
+    with Session(engine) as session:
+        assert session.get(Project, UUID(project["id"])) is None
+    assert client.post("/api/v1/projects", json={"name": "新名字", "kind": kind, "scheme_version": "v1.2.0", "algo_version": "v1.2.0"}).status_code == 201
+
+
+@pytest.fixture
+def idle_jupyter(monkeypatch):
+    calls = []
+
+    def get(path, headers, *, params=None, method="GET", body=None):
+        calls.append((path, headers))
+        payload = {"project_id": body["project_id"], "lease": body["lease"]} if method == "POST" else []
+        return SimpleNamespace(status_code=204 if method == "DELETE" else 200, json=lambda: payload)
+
+    monkeypatch.setattr(deletion, "jupyter_request", get)
+    return calls
+
+
+def create_cleanup_project(client, name="cleanup", kind="factor"):
+    response = client.post("/api/v1/projects", json={
+        "name": name, "kind": kind, "scheme_version": "v1.2.0", "algo_version": "v1.2.0",
+    })
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+@pytest.mark.parametrize("kind", ["factor", "model", "optimize", "control", "execution"])
+def test_delete_project_removes_own_runs_and_preserves_other_resources(projects_client, idle_jupyter, kind):
+    client, root, engine = projects_client
+    project = create_cleanup_project(client, kind=kind)
+    other = create_cleanup_project(client, name="unrelated", kind=kind)
+    directory = root / project["directory"]
+    kernel = kernel_directory(project["id"])
+    run_id = uuid4()
+    report = root / "runs" / str(run_id) / "report"
+    report.mkdir(parents=True)
+    manifest = {"status": "success", "reports": {"factor": "result.parquet"}}
+    (report / "run.json").write_text(json.dumps(manifest))
+    (report / "result.parquet").write_bytes(b"PAR1testPAR1")
+    (report.parent / "package.whl").write_bytes(b"frozen wheel")
+    with Session(engine) as session:
+        session.add(ProjectVersion(id=run_id, project_id=UUID(project["id"]), number=1,
+                                   package_version="1.2.1", status="success"))
+        session.commit()
+    url = f"/api/v1/projects/{project['id']}"
+    response = client.delete(url + "?delete_files=true")
+    assert response.status_code == 204, response.text
+    assert not directory.exists()
+    assert not kernel.exists()
+    assert not (root / "projects" / project["kind"] / f".delete-{project['id']}").exists()
+    assert (root / other["directory"] / "research.ipynb").is_file()
+    assert kernel_directory(other["id"]).is_dir()
+    assert not report.parent.exists()
+    assert client.get(f"/api/v1/reports/{run_id}/report/run.json").status_code == 404
+    assert client.get(f"/api/v1/reports/{run_id}/report/result.parquet").status_code == 404
+    with Session(engine) as session:
+        assert session.get(Project, UUID(project["id"])) is None
+        assert session.get(ProjectVersion, run_id) is None
+        assert session.get(ProjectDeletion, UUID(project["id"])) is None
+    assert client.get(url).status_code == 404
+    assert client.delete(url + "?delete_files=true").status_code == 404
+    assert client.delete(url).status_code == 404
+    assert len(idle_jupyter) == 8
+
+
+def test_delete_false_retains_workspace_but_removes_live_identity(projects_client, idle_jupyter):
+    client, root, engine = projects_client
+    project = create_cleanup_project(client)
+    url = f"/api/v1/projects/{project['id']}"
+    assert client.delete(url + "?delete_files=false").status_code == 204
+    assert (root / project["directory"]).is_dir()
+    assert not kernel_directory(project["id"]).exists()
+    with Session(engine) as session:
+        assert session.get(Project, UUID(project["id"])) is None
+    assert client.delete(url + "?delete_files=true").status_code == 404
+    assert (root / project["directory"]).is_dir()
+    response = client.post("/api/v1/projects", json={"name": project["name"], "kind": project["kind"],
+                                                   "scheme_version": "v1.2.0", "algo_version": "v1.2.0"})
+    assert response.status_code == 409 and "目录" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("phase", ["building", "queued", "running"])
+def test_delete_files_rejects_inflight_versions(projects_client, idle_jupyter, phase):
+    client, root, engine = projects_client
+    project = create_cleanup_project(client)
+    with Session(engine) as session:
+        session.add(ProjectVersion(project_id=UUID(project["id"]), number=1,
+                                   package_version="1.2.1", status=phase))
+        session.commit()
+    response = client.delete(f"/api/v1/projects/{project['id']}?delete_files=true")
+    assert response.status_code == 409
+    assert (root / project["directory"]).is_dir()
+    assert kernel_directory(project["id"]).is_dir()
+    assert idle_jupyter == []
+
+
+@pytest.mark.parametrize("phase", ["failed", "submit_failed"])
+def test_delete_files_accepts_finished_versions(projects_client, idle_jupyter, phase):
+    client, root, engine = projects_client
+    project = create_cleanup_project(client)
+    with Session(engine) as session:
+        session.add(ProjectVersion(project_id=UUID(project["id"]), number=1,
+                                   package_version="1.2.1", status=phase))
+        session.commit()
+    assert client.delete(f"/api/v1/projects/{project['id']}?delete_files=true").status_code == 204
+    assert not (root / project["directory"]).exists()
+
+
+@pytest.mark.parametrize("invalid", ["missing", "malformed", "foreign", "kernel"])
+def test_delete_files_rejects_unowned_directory(projects_client, idle_jupyter, invalid):
+    client, root, _ = projects_client
+    project = create_cleanup_project(client)
+    directory = root / project["directory"]
+    marker = directory / ".solo"
+    if invalid == "missing":
+        marker.unlink()
+    elif invalid == "malformed":
+        marker.write_text("not json")
+    elif invalid == "foreign":
+        metadata = json.loads(marker.read_text())
+        metadata["project_id"] = str(uuid4())
+        marker.write_text(json.dumps(metadata))
+    else:
+        kernel = kernel_directory(project["id"]) / "kernel.json"
+        kernel.write_text(json.dumps({"argv": ["/another/project/.venv/bin/python"]}))
+    response = client.delete(f"/api/v1/projects/{project['id']}?delete_files=true")
+    assert response.status_code == 409
+    assert directory.is_dir()
+    assert idle_jupyter == []
+    assert client.get(f"/api/v1/projects/{project['id']}").status_code == 200
+
+
+@pytest.mark.parametrize("usage", ["kernel", "project_session", "renamed_session", "unavailable", "malformed", "busy", "noncanonical_path"])
+def test_delete_files_checks_jupyter_usage(projects_client, monkeypatch, usage):
+    client, root, _ = projects_client
+    project = create_cleanup_project(client)
+    monkeypatch.setattr(SoloSettings, "JUPYTER_TOKEN", "private-token")
+    monkeypatch.setattr(SoloSettings, "JUPYTER_API_URL", "http://jupyter.internal/base")
+
+    def get(url, headers, *, params=None, method="GET", body=None):
+        assert headers == {"Authorization": "token private-token"}
+        if method == "POST":
+            assert body == {"project_id": project["id"], "operation": "delete", "lease": body["lease"]}
+            assert str(UUID(body["lease"])) == body["lease"]
+            return SimpleNamespace(status_code=409 if usage == "busy" else 200,
+                                   json=lambda: {"project_id": project["id"], "lease": body["lease"]})
+        if method == "DELETE":
+            return SimpleNamespace(status_code=204)
+        assert url.startswith("/api/")
+        sessions, kernels = [], []
+        kernel = {"id": "kernel-id", "name": "python3", "execution_state": "busy"}
+        if usage == "kernel":
+            kernels = [{**kernel, "name": f"solo-{project['id']}"}]
+        elif usage == "project_session":
+            kernels = [kernel]
+            sessions = [{"id": "session-id", "path": project["directory"] + "/research.ipynb", "kernel": kernel}]
+        elif usage == "renamed_session":
+            kernel = {**kernel, "name": f"solo-{project['id']}"}
+            kernels = [kernel]
+            sessions = [{"id": "session-id", "path": "elsewhere/notebook.ipynb", "kernel": kernel}]
+        elif usage == "noncanonical_path":
+            sessions = [{"id": "session-id", "path": "projects/factor/other/../cleanup/research.ipynb", "kernel": kernel}]
+        payload = sessions if url.endswith("sessions") else kernels
+        if usage == "malformed":
+            payload = {"unexpected": "object"}
+        return SimpleNamespace(status_code=401 if usage == "unavailable" else 200, json=lambda: payload)
+
+    monkeypatch.setattr(deletion, "jupyter_request", get)
+    response = client.delete(f"/api/v1/projects/{project['id']}?delete_files=true")
+    assert response.status_code == (503 if usage in {"unavailable", "malformed", "noncanonical_path"} else 409)
+    assert (root / project["directory"]).is_dir()
+    assert kernel_directory(project["id"]).is_dir()
+    assert "private-token" not in response.text
+
+
+def test_delete_files_ignores_similarly_named_project_session(projects_client, monkeypatch):
+    client, root, _ = projects_client
+    project = create_cleanup_project(client)
+    def get(url, headers, *, params=None, method="GET", body=None):
+        if method == "POST":
+            return SimpleNamespace(status_code=200, json=lambda: {"project_id": project["id"], "lease": body["lease"]})
+        if method == "DELETE":
+            assert url == "/solo/project/operations"
+            return SimpleNamespace(status_code=204)
+        kernel = {"id": "other-kernel", "name": "python3", "execution_state": "busy"}
+        payload = [{"id": "other-session", "path": project["directory"] + "-other/research.ipynb", "kernel": kernel}] if url.endswith("sessions") else [kernel]
+        return SimpleNamespace(status_code=200, json=lambda: payload)
+    monkeypatch.setattr(deletion, "jupyter_request", get)
+    assert client.delete(f"/api/v1/projects/{project['id']}?delete_files=true").status_code == 204
+    assert not (root / project["directory"]).exists()
+
+
+def test_delete_files_rolls_back_staging_if_kernel_starts(projects_client, monkeypatch):
+    client, root, _ = projects_client
+    project = create_cleanup_project(client)
+    checks = 0
+    def get(url, headers, *, params=None, method="GET", body=None):
+        nonlocal checks
+        if method == "POST":
+            return SimpleNamespace(status_code=200, json=lambda: {"project_id": project["id"], "lease": body["lease"]})
+        if method == "DELETE":
+            return SimpleNamespace(status_code=204)
+        if url.endswith("sessions"):
+            checks += 1
+        payload = [{"id": "late-kernel", "name": f"solo-{project['id']}", "execution_state": "busy"}] if checks > 2 and url.endswith("kernels") else []
+        return SimpleNamespace(status_code=200, json=lambda: payload)
+    monkeypatch.setattr(deletion, "jupyter_request", get)
+    assert client.delete(f"/api/v1/projects/{project['id']}?delete_files=true").status_code == 409
+    assert (root / project["directory"] / ".solo").is_file()
+    assert not (root / "projects" / project["kind"] / f".delete-{project['id']}").exists()
+    assert client.get(f"/api/v1/projects/{project['id']}").status_code == 200
+
+
+def test_delete_files_commit_failure_restores_workspace(projects_client, idle_jupyter, monkeypatch):
+    client, root, engine = projects_client
+    project = create_cleanup_project(client)
+    with Session(engine) as session:
+        record = session.get(Project, UUID(project["id"]))
+        original_commit = session.commit
+        commits = 0
+        def fail():
+            nonlocal commits
+            commits += 1
+            if commits == 2:
+                raise RuntimeError("commit failed")
+            return original_commit()
+        monkeypatch.setattr(session, "commit", fail)
+        with pytest.raises(RuntimeError, match="commit failed"):
+            deletion.delete_project(record.id, session)
+    assert (root / project["directory"] / ".solo").is_file()
+    assert kernel_directory(project["id"]).is_dir()
+    assert not (root / "projects" / project["kind"] / f".delete-{project['id']}").exists()
+    assert client.get(f"/api/v1/projects/{project['id']}").status_code == 200
+
+
+def test_delete_files_cleanup_failure_is_retryable(projects_client, idle_jupyter, monkeypatch):
+    client, root, _ = projects_client
+    project = create_cleanup_project(client)
+    original = deletion.shutil.rmtree
+    def fail(path, *args, **kwargs):
+        raise PermissionError("directory busy")
+    monkeypatch.setattr(deletion.shutil, "rmtree", fail)
+    url = f"/api/v1/projects/{project['id']}?delete_files=true"
+    response = client.delete(url)
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "project_cleanup_incomplete"
+    assert response.json()["detail"]["deleted"] is True
+    assert not (root / project["directory"]).exists()
+    stage = root / "projects" / project["kind"] / f".delete-{project['id']}"
+    assert (stage / "metadata.json").is_file()
+    assert (stage / "project" / "research.ipynb").is_file()
+    assert not kernel_directory(project["id"]).exists()
+    assert (kernel_directory(project["id"]).parent / f".delete-{project['id']}" / "kernel").is_dir()
+    monkeypatch.setattr(deletion.shutil, "rmtree", original)
+    assert client.delete(url).status_code == 204
+    assert not stage.exists()
+    assert not kernel_directory(project["id"]).exists()
+
+
+@pytest.mark.parametrize("consumer_kind", ["project", "strategy"])
+def test_delete_files_does_not_block_frozen_active_consumer(projects_client, idle_jupyter, consumer_kind):
+    client, root, engine = projects_client
+    project = create_cleanup_project(client)
+    if consumer_kind == "project":
+        consumer = create_cleanup_project(client, name="consumer", kind="model")
+        (root / consumer["directory"] / "uv.lock").write_text(
+            f'[[package]]\nname="factor-{UUID(project["id"]).hex[:4]}"\nversion="1.2.1"\n',
+        )
+    with Session(engine) as session:
+        if consumer_kind == "project":
+            session.add(ProjectVersion(project_id=UUID(consumer["id"]), number=1,
+                                       package_version="1.2.1", status="building"))
+        else:
+            session.add(Strategy(name="consumer", status="building", forms={},
+                                 components={"factor": {"project_id": project["id"]}}))
+        session.commit()
+    assert client.delete(f"/api/v1/projects/{project['id']}?delete_files=true").status_code == 204
+    assert not (root / project["directory"]).exists()
+    assert idle_jupyter
+    with Session(engine) as session:
+        if consumer_kind == "project":
+            assert session.get(Project, UUID(consumer["id"])) is not None
+            assert session.scalar(select(ProjectVersion)).status == "building"
+        else:
+            assert session.scalar(select(Strategy)).status == "building"
+
+
+@pytest.mark.parametrize("location", ["project", "kind", "marker", "kernel"])
+def test_delete_files_rejects_symlink_paths(projects_client, idle_jupyter, location):
+    client, root, _ = projects_client
+    project = create_cleanup_project(client)
+    directory = root / project["directory"]
+    if location == "marker":
+        original = directory / ".solo"
+        target = root / "outside-marker.json"
+    elif location == "kernel":
+        original = kernel_directory(project["id"])
+        target = root / "outside-kernel"
+    elif location == "kind":
+        original = directory.parent
+        target = root / "outside-kind"
+    else:
+        original = directory
+        target = root / "outside-project"
+    original.rename(target)
+    try:
+        original.symlink_to(target, target_is_directory=location != "marker")
+    except OSError:
+        target.rename(original)
+        pytest.skip("系统不允许创建测试符号链接")
+    response = client.delete(f"/api/v1/projects/{project['id']}?delete_files=true")
+    assert response.status_code == 409
+    assert target.exists()
+    assert original.is_symlink()
+    assert idle_jupyter == []
+
+
+def test_delete_files_does_not_follow_nested_links(projects_client, idle_jupyter):
+    client, root, _ = projects_client
+    project = create_cleanup_project(client)
+    target = root / "unrelated-source.py"
+    target.write_text("keep")
+    link = root / project["directory"] / "linked-source.py"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("系统不允许创建测试符号链接")
+    assert client.delete(f"/api/v1/projects/{project['id']}?delete_files=true").status_code == 204
+    assert target.read_text() == "keep"
+
+
+def test_delete_files_handles_missing_workspace(projects_client, idle_jupyter):
+    client, root, _ = projects_client
+    project = create_cleanup_project(client)
+    deletion.shutil.rmtree(root / project["directory"])
+    assert client.delete(f"/api/v1/projects/{project['id']}?delete_files=true").status_code == 204
+    assert not kernel_directory(project["id"]).exists()
+
+
+def test_delete_files_can_retry_partial_kernel_cleanup(projects_client, idle_jupyter, monkeypatch):
+    client, root, _ = projects_client
+    project = create_cleanup_project(client)
+    original = deletion.shutil.rmtree
+    kernel = kernel_directory(project["id"])
+    staged_kernel = kernel.parent / f".delete-{project['id']}" / "kernel"
+    def fail(path, *args, **kwargs):
+        if path == staged_kernel:
+            (staged_kernel / "kernel.json").unlink()
+            raise PermissionError("partial kernel cleanup")
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(deletion.shutil, "rmtree", fail)
+    url = f"/api/v1/projects/{project['id']}?delete_files=true"
+    assert client.delete(url).status_code == 503
+    assert not kernel.exists()
+    assert staged_kernel.is_dir()
+    assert not (staged_kernel / "kernel.json").exists()
+    monkeypatch.setattr(deletion.shutil, "rmtree", original)
+    assert client.delete(url).status_code == 204
+    assert not kernel.exists()
+    assert not (root / "projects" / project["kind"] / f".delete-{project['id']}").exists()
+
+
+def test_delete_files_can_retry_final_staging_removal_failure(projects_client, idle_jupyter, monkeypatch):
+    client, root, _ = projects_client
+    project = create_cleanup_project(client)
+    stage = root / "projects" / project["kind"] / f".delete-{project['id']}"
+    original = Path.rmdir
+    def fail(path):
+        if path == stage:
+            raise PermissionError("final removal failed")
+        return original(path)
+    monkeypatch.setattr(Path, "rmdir", fail)
+    url = f"/api/v1/projects/{project['id']}?delete_files=true"
+    assert client.delete(url).status_code == 503
+    assert stage.is_dir()
+    assert list(stage.iterdir()) == []
+    assert not kernel_directory(project["id"]).exists()
+    monkeypatch.setattr(Path, "rmdir", original)
+    assert client.delete(url).status_code == 204
+    assert not stage.exists()
+
+
+def test_jupyter_request_keeps_token_and_ignores_implicit_auth(monkeypatch):
+    prepared = []
+    monkeypatch.setattr(SoloSettings, "JUPYTER_API_URL", "http://jupyter.invalid/base")
+    monkeypatch.setattr(deletion.requests.sessions, "get_netrc_auth", lambda *args: ("other-user", "other-password"))
+    def send(self, request, **kwargs):
+        prepared.append((self.trust_env, request, kwargs))
+        response = deletion.requests.Response()
+        response.status_code = 200
+        response._content = b"[]"
+        return response
+    monkeypatch.setattr(deletion.requests.Session, "send", send)
+    assert deletion.jupyter_request("/api/kernels", {"Authorization": "token private-token"}).status_code == 200
+    trust_env, request, kwargs = prepared[0]
+    assert trust_env is False
+    assert request.url == "http://jupyter.invalid/base/api/kernels"
+    assert request.headers["Authorization"] == "token private-token"
+    assert kwargs["timeout"] == (3, 10)
+    assert kwargs["allow_redirects"] is False
 
 
 @pytest.mark.parametrize("name", ["../escape", "..", ".hidden", "a/b", "a\\b", "", "  ", "a\nxx"])

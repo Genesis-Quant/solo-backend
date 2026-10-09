@@ -66,6 +66,7 @@ class SoloSettings:
     SCHEME_REPOSITORY = "genesis-quant/solo-algo-scheme"
     GITEE_TOKEN = os.getenv("GITEE_TOKEN", "")
     JUPYTER_URL = os.getenv("JUPYTER_URL", "http://127.0.0.1:8888").rstrip("/")
+    JUPYTER_API_URL = os.getenv("JUPYTER_API_URL", JUPYTER_URL).rstrip("/")
     JUPYTER_TOKEN = os.getenv("JUPYTER_TOKEN", "")
     WEB_ORIGINS = os.getenv(
         "SOLO_WEB_ORIGINS", "http://127.0.0.1:5174,http://localhost:5174"

@@ -1,5 +1,6 @@
 """读取 Gitee Tag，并从对应 commit 归档复制指定模板目录。"""
 
+import json
 import re
 import stat
 import subprocess
@@ -208,6 +209,20 @@ def unpack_template(content: bytes, kind: ProjectKind, destination: Path, packag
     module = destination / "src" / old_module
     if module.is_dir():
         module.rename(module.with_name(new_module))
+    notebook_data = json.loads(notebook.read_text(encoding="utf-8"))
+    title = {"factor": "因子研究", "model": "策略建模研究", "optimize": "组合优化研究",
+             "control": "订单风控研究", "execution": "算法下单研究"}[kind]
+    prefix = kind.title()
+    exports = "Factor, FactorAnalysisParams, FactorReportForm" if kind == "factor" else f"{prefix}Algo, {prefix}AnalysisParams, {prefix}ReportForm"
+    notebook_data["cells"] = [
+        {"cell_type": "markdown", "id": "research-title", "metadata": {}, "source": [f"# {title}"]},
+        {"cell_type": "code", "id": "research-imports", "execution_count": None, "metadata": {},
+         "outputs": [], "source": [f"from {new_module} import {exports}"]},
+        {"cell_type": "code", "id": "research-work", "execution_count": None, "metadata": {}, "outputs": [], "source": []},
+    ]
+    notebook_data.setdefault("nbformat", 4)
+    notebook_data.setdefault("nbformat_minor", 5)
+    notebook.write_text(json.dumps(notebook_data, ensure_ascii=False, indent=2), encoding="utf-8")
     (destination / ".gitignore").write_text(".venv/\n__pycache__/\n*.py[cod]\n.ipynb_checkpoints/\ndist/\n.env\n", encoding="utf-8")
 
 

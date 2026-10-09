@@ -6,10 +6,11 @@ from uuid import UUID
 from config import SoloSettings
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import select
 
 from core.apps import version_policy as policy
+from core.apps.artifacts.service import lock_registry
 from core.apps.projects.versions import (
     download_workflow_log,
     refresh_version,
@@ -27,10 +28,20 @@ router = APIRouter(prefix="/api/v1/strategies", tags=["strategies"])
 
 class Selection(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    model: UUID
+    model: UUID | None = None
     optimize: UUID | None = None
     control: UUID | None = None
     execution: UUID | None = None
+    artifacts: dict[Literal["model", "optimize", "control", "execution"], UUID] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_references(self):
+        for kind in self.artifacts:
+            if getattr(self, kind) is not None:
+                raise ValueError(f"{kind} 不能同时选择研究版本和已发布成果")
+        if self.model is None and "model" not in self.artifacts:
+            raise ValueError("请选择 Model 研究版本或已发布成果")
+        return self
 
 
 class CreateStrategy(BaseModel):
@@ -75,17 +86,26 @@ def create_strategy(body: CreateStrategy, session: Database) -> dict:
     if not body.name.strip() or set(body.forms) != set(KINDS):
         raise HTTPException(422, "请填写策略名称和全部环节的 Form")
     try:
+        lock_registry(session)
         components = selected(session, body.selections.model_dump())
         require_components(components)
-        strategy = Strategy(name=body.name.strip(), forms=body.forms, components={
-            kind: {key: value for key, value in item.items() if key not in {"component", "input"}}
-            for kind, item in components.items()
-        })
+        descriptors = {}
+        for kind, item in components.items():
+            descriptor = {key: value for key, value in item.items()
+                          if key not in {"component", "input", "environment_path"}}
+            if item.get("component"):
+                descriptor["component_snapshot"] = {key: item["component"][key]
+                                                    for key in ("package", "version", "entry", "sha256")}
+            descriptors[kind] = descriptor
+        strategy = Strategy(name=body.name.strip(), forms=body.forms, components=descriptors)
         session.add(strategy)
         session.commit()
         directory = SoloSettings.SHARED_DIR / "runs" / str(strategy.id)
         try:
             strategy.scheme_version = build(components, body.forms, directory)
+            strategy.accepted_artifacts = policy.capture_task_artifacts(
+                session, strategy, kind="strategy", directory=directory,
+            )
             policy.check_task(session, strategy, kind="strategy", directory=directory)
             _, lockfile, _ = policy.task_files(directory, "strategy")
             strategy.input_sha256 = hashlib.sha256((directory / "input.json").read_bytes()).hexdigest()

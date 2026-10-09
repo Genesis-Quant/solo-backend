@@ -7,14 +7,16 @@ import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 from zipfile import ZipFile
 
 import pytest
 import tomlkit
 import tomllib
 from core.apps.strategies import service
+from core.apps.strategies import views as strategy_views
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 
 @pytest.mark.parametrize("kind,status,archived", [
@@ -45,12 +47,18 @@ def saved_result(tmp_path, kind, scheme):
         archive.writestr(f"{package}.dist-info/METADATA", f"Name: {package}\nVersion: {version.package_version}\n"
                          f"Requires-Dist: scheme>={series}.0,<{series.split('.')[0]}.{int(series.split('.')[1]) + 1}.0\n")
         archive.writestr(package.replace("-", "_") + "/__init__.py", "")
+    component = {"version": version.package_version, "package": package,
+                 "wheel": str(wheel), "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+                 "entry": f"{package.replace('-', '_')}:Algo"}
     (directory / "input.json").write_text(json.dumps({
-        "kind": kind, "algos": {kind: {"version": version.package_version, "package": package,
-             "wheel": str(wheel), "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
-             "entry": f"{package.replace('-', '_')}:Algo"}},
+        "kind": kind, "algos": {kind: component},
         "environment": {"lockfile": str(directory / "uv.lock")},
     }))
+    version.accepted_artifacts = {package: {
+        **{key: component[key] for key in ("package", "version", "entry", "sha256")},
+        "artifact_id": str(uuid4()), "kind": kind, "scheme_version": scheme,
+        "sources": service.policy.project_sources(project),
+    }}
     return version, project
 
 
@@ -87,6 +95,42 @@ def test_selection_preserves_supported_report_major(tmp_path, monkeypatch):
     session.scalar.return_value = None
     with pytest.raises(HTTPException, match="支持 Scheme 1.x"):
         service.selected(session, {"model": uuid4()})
+
+
+@pytest.mark.parametrize("body", [
+    {}, {"artifacts": {}}, {"optimize": str(uuid4())},
+    {"artifacts": {"factor": str(uuid4())}}, {"artifacts": {"model": None}},
+    {"model": str(uuid4()), "artifacts": {"model": str(uuid4())}},
+    {"model": str(uuid4()), "control": str(uuid4()), "artifacts": {"control": str(uuid4())}},
+])
+def test_selection_schema_rejects_missing_model_unknown_kind_and_conflicting_references(body):
+    with pytest.raises(ValidationError):
+        strategy_views.Selection.model_validate(body)
+
+
+def test_selection_schema_supports_legacy_artifact_and_mixed_references():
+    model, optimize, control = uuid4(), uuid4(), uuid4()
+    legacy = strategy_views.Selection(model=model)
+    assert legacy.artifacts == {}
+    published = strategy_views.Selection(artifacts={"model": model, "optimize": optimize}, control=control)
+    assert published.model is None
+    assert published.artifacts == {"model": model, "optimize": optimize}
+    assert published.control == control
+    legacy.artifacts["execution"] = uuid4()
+    assert strategy_views.Selection(model=model).artifacts == {}
+
+
+@pytest.mark.parametrize("selections", [
+    {}, {"artifacts": {}}, {"artifacts": {"factor": uuid4()}},
+    {"model": uuid4(), "artifacts": {"model": uuid4()}},
+    {"model": uuid4(), "execution": uuid4(), "artifacts": {"execution": uuid4()}},
+])
+def test_direct_selection_rejects_invalid_references_before_database_reads(selections):
+    session = MagicMock()
+    with pytest.raises(HTTPException) as error:
+        service.selected(session, selections)
+    assert error.value.status_code == 422
+    session.get.assert_not_called()
 
 
 @pytest.fixture
@@ -144,6 +188,312 @@ def test_build_freezes_wheel_and_merges_each_algo_params(assembly, scheme_versio
     assert config["tool"]["uv"]["sources"]["scheme"] == {"git": "https://example.com/scheme", "rev": "f" * 40}
     assert config["tool"]["uv"]["constraint-dependencies"] == ["model-test", "scheme"]
     command.assert_called_once_with(["uv", "lock", "--project", str(destination / "environment")], destination / "environment")
+
+
+@pytest.mark.parametrize("default_url", ["https://pypi.tuna.tsinghua.edu.cn/simple", "https://private.invalid/simple"])
+def test_build_preserves_model_registry_policy_without_other_uv_settings(assembly, default_url):
+    components, forms, _, destination, command = assembly
+    original = destination.parent / "source/pyproject.toml"
+    config = tomllib.loads(original.read_text())
+    indexes = [{"name": "private", "url": "https://packages.invalid/simple", "explicit": True, "default": False,
+                "format": "simple"}, {"name": "default", "url": default_url, "default": True, "explicit": False}]
+    config["tool"]["uv"].update({"index": indexes + [{"name": "old-flat", "url": "../old-wheels", "format": "flat"}],
+                               "index-strategy": "unsafe-best-match", "override-dependencies": ["unused==9"],
+                               "dev-dependencies": ["unused-dev==9"]})
+    config["tool"]["uv"]["sources"]["private-dep"] = {"index": "private"}
+    original.write_text(tomlkit.dumps(config))
+    assert service.build(components, forms, destination) == "1.2.0"
+    uv = tomllib.loads((destination / "environment/pyproject.toml").read_text())["tool"]["uv"]
+    assert uv["index"] == indexes
+    assert uv["index-strategy"] == "unsafe-best-match"
+    assert uv["sources"]["private-dep"] == {"index": "private"}
+    assert uv["sources"]["scheme"] == config["tool"]["uv"]["sources"]["scheme"]
+    assert set(uv) == {"package", "sources", "index", "index-strategy", "constraint-dependencies"}
+    command.assert_called_once()
+
+
+def test_build_preserves_legacy_model_registry_urls_without_tsinghua_override(assembly):
+    components, forms, _, destination, _ = assembly
+    original = destination.parent / "source/pyproject.toml"
+    config = tomllib.loads(original.read_text())
+    config["tool"]["uv"].update({"index-url": "https://private.invalid/simple",
+                               "extra-index-url": ["https://packages.invalid/simple"],
+                               "index-strategy": "unsafe-best-match"})
+    original.write_text(tomlkit.dumps(config))
+    assert service.build(components, forms, destination) == "1.2.0"
+    uv = tomllib.loads((destination / "environment/pyproject.toml").read_text())["tool"]["uv"]
+    assert uv["index"] == []
+    for key in ("index-url", "extra-index-url", "index-strategy"):
+        assert uv[key] == config["tool"]["uv"][key]
+
+
+@pytest.mark.parametrize("indexes", [
+    [], [{"name": "old-flat", "url": "../old-wheels", "format": "flat", "default": True}],
+    [{"name": "private", "url": "https://packages.invalid/simple", "explicit": True}],
+])
+def test_build_defaults_to_tsinghua_without_explicit_model_default(assembly, indexes):
+    components, forms, _, destination, _ = assembly
+    original = destination.parent / "source/pyproject.toml"
+    config = tomllib.loads(original.read_text())
+    if indexes:
+        config["tool"]["uv"]["index"] = indexes
+    original.write_text(tomlkit.dumps(config))
+    assert service.build(components, forms, destination) == "1.2.0"
+    uv = tomllib.loads((destination / "environment/pyproject.toml").read_text())["tool"]["uv"]
+    assert uv["index"] == [index for index in indexes if index.get("format") != "flat"] + [
+        {"url": "https://pypi.tuna.tsinghua.edu.cn/simple", "default": True},
+    ]
+    assert "index-strategy" not in uv
+
+
+@pytest.mark.parametrize("indexes", [
+    [], [{"name": "private", "url": "../old-wheels", "format": "flat"}],
+    [{"name": "private", "url": "https://one.invalid/simple"},
+     {"name": "private", "url": "https://two.invalid/simple"}],
+])
+def test_build_rejects_missing_flat_or_ambiguous_named_registry(assembly, indexes):
+    components, forms, _, destination, command = assembly
+    original = destination.parent / "source/pyproject.toml"
+    config = tomllib.loads(original.read_text())
+    config["tool"]["uv"].update(index=indexes)
+    config["tool"]["uv"]["sources"]["private-dep"] = {"index": "private"}
+    original.write_text(tomlkit.dumps(config))
+    with pytest.raises(ValueError, match="registry"):
+        service.build(components, forms, destination)
+    command.assert_not_called()
+    assert not (destination / "input.json").exists()
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_build_preserves_component_named_source_without_importing_its_default_policy(assembly, conflict):
+    components, forms, _, destination, command = assembly
+    original = destination.parent / "source/pyproject.toml"
+    config = tomllib.loads(original.read_text())
+    if conflict:
+        config["tool"]["uv"]["index"] = [{"name": "private", "url": "https://other.invalid/simple"}]
+        original.write_text(tomlkit.dumps(config))
+    source = destination.parent / "optimize"
+    source.mkdir()
+    wheel = source / "optimize_test-1.2.1-py3-none-any.whl"
+    wheel.write_bytes(b"immutable optimize")
+    uv = {"sources": {"scheme": config["tool"]["uv"]["sources"]["scheme"], "private-dep": {"index": "private"}},
+          "index": [{"name": "private", "url": "https://packages.invalid/simple", "default": True, "explicit": False},
+                    {"name": "unused", "url": "https://unused.invalid/simple"},
+                    {"name": "old-flat", "url": "../old-wheels", "format": "flat"}],
+          "index-strategy": "unsafe-best-match"}
+    (source / "pyproject.toml").write_text(tomlkit.dumps({"tool": {"uv": uv}}))
+    (source / "uv.lock").write_text('[[package]]\nname="scheme"\nversion="1.2.0"\n')
+    components["optimize"] = {**components["model"], "version_id": str(uuid4()),
+                              "input": {"environment": {"lockfile": str(source / "uv.lock")}},
+                              "component": {"package": "optimize-test", "version": "1.2.1", "wheel": str(wheel),
+                                            "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(), "entry": "optimize_test:Algo"}}
+    if conflict:
+        with pytest.raises(ValueError, match="同名 registry.*配置冲突"):
+            service.build(components, forms, destination)
+        command.assert_not_called()
+        return
+    assert service.build(components, forms, destination) == "1.2.0"
+    frozen = tomllib.loads((destination / "environment/pyproject.toml").read_text())["tool"]["uv"]
+    assert frozen["index"] == [{"name": "private", "url": "https://packages.invalid/simple", "default": False, "explicit": True},
+                              {"url": "https://pypi.tuna.tsinghua.edu.cn/simple", "default": True}]
+    assert frozen["sources"]["private-dep"] == {"index": "private"}
+    assert "index-strategy" not in frozen
+
+
+@pytest.mark.parametrize("admitted", [True, False])
+def test_create_strategy_captures_independent_descriptors_before_admission_and_queue(assembly, monkeypatch, admitted):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from core.apps.strategies.models import Strategy
+    from core.database.base import Base
+
+    components, forms, _, destination, _ = assembly
+    artifact_id = uuid4()
+    components["model"].update(artifact_id=str(artifact_id), version_id=None,
+                               environment_path=str(destination.parent / "source"),
+                               dependencies={"factor-abcd": {"artifact_id": str(uuid4())}})
+    monkeypatch.setattr(strategy_views, "selected", lambda *args: components)
+    monkeypatch.setattr(service.SoloSettings, "SHARED_DIR", destination.parent)
+    scheduler = MagicMock()
+    monkeypatch.setattr(strategy_views, "DolphinSchedulerClient", scheduler)
+    snapshot = {"model-test": {"artifact_id": str(artifact_id), "sha256": components["model"]["component"]["sha256"]}}
+    capture = MagicMock(return_value=snapshot)
+    monkeypatch.setattr(service.policy, "capture_task_artifacts", capture)
+
+    def check(session, strategy, **kwargs):
+        assert strategy.accepted_artifacts == snapshot
+        assert strategy.input_sha256 is None and strategy.lock_sha256 is None
+        assert strategy.status == "building"
+        if not admitted:
+            raise ValueError("invalid accepted wheel snapshot")
+        return False
+
+    monkeypatch.setattr(service.policy, "check_task", check)
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    try:
+        with Session(engine, expire_on_commit=False) as session:
+            response = strategy_views.create_strategy(strategy_views.CreateStrategy(
+                name="independent", selections={"artifacts": {"model": artifact_id}}, forms=forms,
+            ), session)
+            strategy = session.get(Strategy, UUID(response["id"]))
+            descriptor = strategy.components["model"]
+            assert descriptor["artifact_id"] == str(artifact_id)
+            assert descriptor["version_id"] is None
+            assert descriptor["component_snapshot"] == {key: components["model"]["component"][key]
+                                                       for key in ("package", "version", "entry", "sha256")}
+            assert descriptor["dependencies"] == components["model"]["dependencies"]
+            assert not {"input", "component", "environment_path"} & set(descriptor)
+            assert str(destination.parent / "source") not in json.dumps(strategy.components)
+            capture.assert_called_once_with(session, strategy, kind="strategy",
+                                            directory=destination.parent / "runs" / str(strategy.id))
+            assert strategy.accepted_artifacts == snapshot
+            if admitted:
+                assert response["status"] == "queued"
+                assert strategy.input_sha256 and strategy.lock_sha256
+                scheduler.return_value.__enter__.return_value.start.assert_called_once()
+            else:
+                assert response["status"] == "failed"
+                assert strategy.input_sha256 is None and strategy.lock_sha256 is None
+                scheduler.return_value.__enter__.return_value.start.assert_not_called()
+    finally:
+        engine.dispose()
+
+
+def test_artifact_selection_uses_bundle_without_origin_reads_and_builds_frozen_copy(assembly, monkeypatch):
+    from core.apps.artifacts import service as artifacts
+
+    components, forms, _, destination, _ = assembly
+    artifact_id = uuid4()
+    model = {**components["model"], "artifact_id": str(artifact_id), "version_id": None, "published": True}
+    resolve = MagicMock(return_value=model)
+    monkeypatch.setattr(artifacts, "artifact_component", resolve)
+    session = MagicMock()
+    selected = service.selected(session, {"artifacts": {"model": artifact_id}})
+    resolve.assert_called_once_with(session, artifact_id)
+    session.get.assert_not_called()
+    assert selected["model"]["version_id"] is None
+    assert selected["model"]["artifact_id"] == str(artifact_id)
+    assert service.build(selected, forms, destination) == "1.2.0"
+    original = components["model"]["component"]["wheel"]
+    from pathlib import Path
+
+    Path(original).unlink()
+    frozen = json.loads((destination / "input.json").read_text())["algos"]["model"]
+    assert frozen["sha256"] == model["component"]["sha256"]
+    assert Path(frozen["wheel"]).read_bytes() == b"immutable candidate"
+    assert str(Path(original).parent) not in (destination / "input.json").read_text()
+
+
+def test_artifact_form_syncs_bundle_environment_without_existing_venv(tmp_path, monkeypatch):
+    environment = tmp_path / "artifacts/bundle/environment"
+    environment.mkdir(parents=True)
+    (environment / "uv.lock").write_text('[[package]]\nname="scheme"\nversion="1.2.0"\n')
+    components = {kind: {"version_id": None} for kind in service.KINDS}
+    components["model"] = {
+        "artifact_id": str(uuid4()), "version_id": None, "scheme_version": "1.2.0",
+        "root_sources": {"scheme": {"tag": "v1.2.0", "commit": "b" * 40},
+                         "template": {"tag": "v1.2.0", "commit": "a" * 40}},
+        "component": {"version": "1.2.1", "entry": "model_abcd:ModelAlgo"},
+        "input": {"environment": {"lockfile": str(environment / "uv.lock")}, "backtest": {"saved": True}},
+    }
+    command = MagicMock(side_effect=["", '{"values": {"restored": true}}'])
+    monkeypatch.setattr(service, "command", command)
+    assert not (environment / ".venv").exists()
+    assert service.inspect_component(components, "model") == {"values": {"restored": True}}
+    assert command.call_args_list[0].args == (["uv", "sync", "--project", str(environment), "--locked", "--no-dev"], environment)
+    python_args, cwd, data = command.call_args_list[1].args
+    assert python_args[0] == str(environment / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
+    assert cwd == environment
+    assert data["entry"] == "model_abcd:ModelAlgo"
+    assert data["saved"] == {"saved": True}
+
+
+@pytest.mark.parametrize("tamper", ["kind", "artifact-id", "unpublished", "retired", "lock-scheme", "result-series"])
+def test_artifact_selection_rejects_mismatched_or_retired_bundle_before_commands(assembly, monkeypatch, tamper):
+    from core.apps.artifacts import service as artifacts
+    from pathlib import Path
+
+    components, _, _, destination, command = assembly
+    artifact_id = uuid4()
+    model = {**components["model"], "artifact_id": str(artifact_id), "version_id": None, "published": True}
+    if tamper == "kind":
+        model["kind"] = "optimize"
+    elif tamper == "artifact-id":
+        model["artifact_id"] = str(uuid4())
+    elif tamper == "unpublished":
+        model["published"] = False
+    elif tamper == "retired":
+        model["root_sources"] = {**model["root_sources"], "template": {
+            "tag": "v1.2.0", "commit": service.policy.load_policy()["retired_releases"]["template"][0]["commit"],
+        }}
+    elif tamper == "lock-scheme":
+        Path(model["input"]["environment"]["lockfile"]).write_text('[[package]]\nname="scheme"\nversion="1.2.7"\n')
+    else:
+        model["component"] = {**model["component"], "version": "1.3.1"}
+    monkeypatch.setattr(artifacts, "artifact_component", lambda *args: model)
+    session = MagicMock()
+    with pytest.raises(HTTPException) as error:
+        service.selected(session, {"artifacts": {"model": artifact_id}})
+    assert error.value.status_code == 422
+    if tamper == "retired":
+        assert error.value.detail["code"] == "version_retired"
+    command.assert_not_called()
+    session.get.assert_not_called()
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("model_scheme,component_scheme,compatible", [
+    ("1.2.0", "1.2.7", True), ("1.2.7", "1.2.0", True), ("1.2.0", "1.3.0", False),
+])
+@pytest.mark.parametrize("kind", service.KINDS[1:])
+def test_artifact_selection_preserves_same_scheme_series(tmp_path, monkeypatch, model_scheme, component_scheme, compatible, kind):
+    from core.apps.artifacts import service as artifacts
+
+    monkeypatch.setattr(service.SoloSettings, "SHARED_DIR", tmp_path)
+    candidates, identifiers = {}, {}
+    for stage, scheme in (("model", model_scheme), (kind, component_scheme)):
+        version, project = saved_result(tmp_path, stage, scheme)
+        source = json.loads((service.version_directory(version) / "input.json").read_text())
+        identifier = uuid4()
+        identifiers[stage] = identifier
+        candidates[identifier] = {
+            "label": stage, "kind": stage, "artifact_id": str(identifier), "version_id": None,
+            "scheme_version": scheme, "root_sources": service.policy.project_sources(project),
+            "component": source["algos"][stage], "input": source,
+        }
+    monkeypatch.setattr(artifacts, "artifact_component", lambda session, identifier: candidates[identifier])
+    session = MagicMock()
+    if compatible:
+        selected = service.selected(session, {"artifacts": identifiers})
+        assert selected["model"]["scheme_version"] == model_scheme
+        assert selected[kind]["scheme_version"] == component_scheme
+    else:
+        with pytest.raises(HTTPException, match="同一 Scheme 主、次版本"):
+            service.selected(session, {"artifacts": identifiers})
+    session.get.assert_not_called()
+
+
+def test_selection_allows_published_model_with_live_legacy_component(tmp_path, monkeypatch):
+    from core.apps.artifacts import service as artifacts
+
+    monkeypatch.setattr(service.SoloSettings, "SHARED_DIR", tmp_path)
+    model, model_project = saved_result(tmp_path, "model", "1.2.7")
+    legacy, legacy_project = saved_result(tmp_path, "optimize", "1.2.0")
+    source = json.loads((service.version_directory(model) / "input.json").read_text())
+    artifact_id = uuid4()
+    published = {"label": "published", "artifact_id": str(artifact_id), "version_id": None,
+                 "scheme_version": model.scheme_version, "root_sources": service.policy.project_sources(model_project),
+                 "component": source["algos"]["model"], "input": source}
+    monkeypatch.setattr(artifacts, "artifact_component", lambda *args: published)
+    session = MagicMock()
+    session.get.side_effect = [legacy, legacy_project]
+    selected = service.selected(session, {"artifacts": {"model": artifact_id}, "optimize": legacy.id})
+    assert selected["model"]["artifact_id"] == str(artifact_id)
+    assert selected["model"]["version_id"] is None
+    assert selected["optimize"]["version_id"] == str(legacy.id)
+    assert selected["optimize"]["artifact_id"] is None
+    assert session.get.call_count == 2
 
 
 def test_build_rejects_conflicting_params_before_writing(assembly):

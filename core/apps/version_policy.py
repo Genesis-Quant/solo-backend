@@ -285,76 +285,221 @@ def validate_wheel(directory: Path, component: dict, *, package: str, version: s
         raise ValueError("任务 wheel 不是有效归档") from error
 
 
-def task_source_reasons(session, record, project, lock: dict, directory: Path, data: dict) -> list[str]:
+def package_name(project) -> str:
+    name = getattr(project, "package_name", None)
+    return canonicalize_name(name if isinstance(name, str) and name else f"{project.kind}-{project.id.hex[:4]}")
+
+
+def task_components(data: dict) -> dict[str, dict]:
+    items = [data["factor"]] if data["kind"] == "factor" else list(data["algos"].values())
+    components = {canonicalize_name(item["package"]): item for item in items if item}
+    if len(components) != len([item for item in items if item]):
+        raise ValueError("任务组件 package 身份重复")
+    return components
+
+
+def local_task_packages(lock: dict) -> dict[str, dict]:
+    packages = {}
+    for item in lock["package"]:
+        source = item.get("source", {})
+        local = "path" in source or ("registry" in source and (
+            Path(source["registry"]).is_absolute() or urlsplit(source["registry"]).scheme in {"", "file"}
+        ))
+        if local or RESEARCH_PACKAGE.fullmatch(canonicalize_name(item["name"])):
+            name = canonicalize_name(item["name"])
+            if name in packages:
+                raise ValueError(f"锁文件含有重复本地产物：{name}")
+            packages[name] = item
+    return packages
+
+
+def snapshot_values(value) -> dict[str, dict]:
+    if value is None:
+        return {}
+    items = value.values() if isinstance(value, dict) else value if isinstance(value, list) else ()
+    result = {}
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("package"), str):
+            raise ValueError("冻结产物快照无效")
+        name = canonicalize_name(item["package"])
+        if name in result and result[name] != item:
+            raise ValueError(f"冻结产物身份冲突：{name}")
+        result[name] = item
+    return result
+
+
+def capture_task_artifacts(session, record, *, project=None, directory: Path | None = None,
+                           kind: str, historical: bool = False) -> dict[str, dict]:
+    """在接受任务前绑定准确产物；执行检查永远不重新推导来源身份。"""
+    from core.apps.artifacts.models import ResearchArtifact
+    from core.apps.artifacts.service import artifact_snapshot, lock_registry, register_asset, register_file, require_artifact
     from core.apps.projects.models import Project, ProjectVersion
 
-    reasons = []
-    if project is not None:
-        reason = source_reason(project_sources(project))
-        if reason:
-            reasons.append(reason)
-    # Strategy roots are database identities, not user-supplied filesystem paths.
-    if hasattr(record, "components"):
-        for item in record.components.values():
-            if not item.get("version_id"):
-                continue
-            version = session.get(ProjectVersion, UUID(item["version_id"]))
-            root = session.get(Project, version.project_id) if version else None
-            if root is None or str(root.id) != item.get("project_id"):
-                raise ValueError("策略 rootProject 与数据库成果记录不一致")
-            reason = source_reason(project_sources(root)) or version_retirement(version)
-            if reason:
-                reasons.append(reason)
-    # Every local wheel is frozen inside this run. Known transitive research wheels
-    # need not have a saved result, but their package identity must map to one root.
-    packages = {canonicalize_name(item["name"]): item for item in lock["package"]}
-    component_list = ([data["factor"]] if data["kind"] == "factor" else list(data["algos"].values()))
-    components = {canonicalize_name(item["package"]): item for item in component_list if item}
-    if len(components) != len([item for item in component_list if item]):
-        raise ValueError("任务组件 package 身份重复")
-    names = {name for name in packages if RESEARCH_PACKAGE.fullmatch(name)} | set(components)
-    roots = {}
-    if names:
-        for root in session.scalars(select(Project)):
-            roots.setdefault(f"{root.kind}-{root.id.hex[:4]}", []).append(root)
+    lock_registry(session)
+    directory = directory or run_path(record.id)
+    data, lockfile, lock = task_files(directory, kind)
     actual, _ = locked_scheme(lock)
-    for name in names:
-        if name not in packages or len(roots.get(name, [])) != 1:
-            raise ValueError(f"未知或歧义研究 rootProject：{name}")
-        require_result_series(packages[name]["version"], actual)
-        root, = roots[name]
-        reason = source_reason(project_sources(root))
-        if reason:
-            raise VersionPolicyError(reason)
-        saved = session.scalar(select(ProjectVersion).where(
-            ProjectVersion.project_id == root.id, ProjectVersion.package_version == packages[name]["version"],
-        ))
-        if saved and saved.scheme_version:
-            reason = version_retirement(saved)
+    if record.input_sha256 and record.input_sha256 != hashlib.sha256((directory / "input.json").read_bytes()).hexdigest():
+        raise ValueError("冻结输入不符合数据库原始接受记录")
+    if record.lock_sha256 and record.lock_sha256 != hashlib.sha256(lockfile.read_bytes()).hexdigest():
+        raise ValueError("冻结锁文件不符合数据库原始接受记录")
+    components = task_components(data)
+    hints: dict[str, list[dict]] = {}
+
+    def add_hints(value) -> None:
+        for name, snapshot in snapshot_values(value).items():
+            candidates = hints.setdefault(name, [])
+            if snapshot not in candidates:
+                candidates.append(snapshot)
+
+    if project is not None:
+        add_hints(getattr(project, "artifact_dependencies", None))
+    roots = {}
+    if project is not None:
+        roots[package_name(project)] = project
+    selections = getattr(record, "components", {}) if project is None else {}
+    for stage, selection in selections.items():
+        if not isinstance(selection, dict):
+            raise ValueError("策略所选产物身份无效")
+        add_hints(selection.get("accepted_artifacts"))
+        add_hints(selection.get("dependencies"))
+        artifact_id = selection.get("artifact_id")
+        if artifact_id:
+            artifact = session.get(ResearchArtifact, UUID(artifact_id))
+            if artifact is None or artifact.kind != stage:
+                raise ValueError("所选发布产物不存在或类型不符")
+            hint = artifact_snapshot(artifact)
+            component = components.get(hint["package"])
+            if component is None or any(component.get(key) != hint.get(key) for key in ("package", "version", "entry", "sha256")):
+                raise ValueError("策略组件与所选独立发布产物不一致")
+            add_hints([hint])
+            add_hints(hint.get("dependencies"))
+        elif selection.get("version_id"):
+            version = session.get(ProjectVersion, UUID(selection["version_id"]))
+            root = session.get(Project, version.project_id) if version is not None else None
+            if root is None or root.kind != stage or str(root.id) != selection.get("project_id"):
+                raise ValueError("策略初始选定研究版本不存在或类型不符")
+            roots[package_name(root)] = root
+            add_hints(getattr(version, "accepted_artifacts", None))
+            original = json.loads((run_path(version.id) / "input.json").read_text(encoding="utf-8"))["algos"][stage]
+            candidate = components.get(original["package"])
+            if candidate is None or any(candidate[key] != original[key] for key in ("package", "version", "entry", "sha256")):
+                raise ValueError("策略组件不符合初始选定成果的准确 wheel")
+        expected = selection.get("component_snapshot")
+        if expected:
+            candidate = components.get(expected.get("package"))
+            if candidate is None or any(candidate.get(key) != expected.get(key) for key in ("package", "version", "entry", "sha256")):
+                raise ValueError("策略组件与所选产物快照不一致")
+
+    legacy_roots = None
+    captured = {}
+    for name, package in local_task_packages(lock).items():
+        wheel = locked_local_wheel(directory, lockfile, package)
+        digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+        component = components.get(name)
+        if component is not None and (
+            wheel != file_in_run(directory, component["wheel"]) or component["sha256"] != digest
+        ):
+            raise ValueError("输入组件与冻结锁文件的准确 wheel 不一致")
+        candidates = hints.get(name, [])
+        matches = [hint for hint in candidates if hint.get("version") == package["version"] and hint.get("sha256") == digest]
+        artifact = None
+        if matches:
+            artifact = require_artifact(session, matches[0], wheel=wheel)
+        elif candidates and project is not None:
+            raise ValueError(f"任务产物不符合已安装的准确依赖：{name}")
+        if artifact is None:
+            found = session.scalar(select(ResearchArtifact).where(ResearchArtifact.sha256 == digest))
+            if isinstance(found, ResearchArtifact):
+                artifact = require_artifact(session, artifact_snapshot(found), wheel=wheel)
+        if artifact is None:
+            root = roots.get(name)
+            if root is None and RESEARCH_PACKAGE.fullmatch(name):
+                if legacy_roots is None:
+                    legacy_roots = {}
+                    for candidate in session.scalars(select(Project)):
+                        legacy_roots.setdefault(package_name(candidate), []).append(candidate)
+                matches = legacy_roots.get(name, [])
+                if len(matches) != 1:
+                    raise ValueError(f"缺少准确研究产物来源：{name}")
+                root = matches[0]
+            if root is not None:
+                if not historical:
+                    reason = source_reason(project_sources(root))
+                    if reason:
+                        raise VersionPolicyError(reason)
+                # Only this Project's own run can supply its ActualScheme here.
+                # An upstream copy must prove exact bytes against the original
+                # owner's frozen run/source inputs, independently of this lock.
+                artifact = register_file(session, wheel, root, component=component,
+                                         scheme_version=str(actual) if root is project else None,
+                                         historical=historical)
+            else:
+                sources = project_sources(project) if project is not None else selections.get("model", {}).get("root_sources", {})
+                artifact = register_asset(session, wheel, sources=sources, scheme_version=str(actual),
+                                          component=component, historical=historical)
+        snapshot = artifact_snapshot(artifact)
+        if snapshot["package"] != name or snapshot["version"] != package["version"] or snapshot["sha256"] != digest:
+            raise ValueError("产物注册身份与冻结锁文件不一致")
+        captured[name] = snapshot
+    if set(components) - set(captured):
+        raise ValueError("输入组件缺少对应的冻结产物")
+    return captured
+
+
+def task_source_reasons(session, record, project, lock: dict, directory: Path, data: dict) -> list[str]:
+    snapshots = snapshot_values(getattr(record, "accepted_artifacts", None))
+    packages = local_task_packages(lock)
+    if set(snapshots) != set(packages):
+        raise ValueError("任务缺少准确接受的产物快照，必须先完成显式迁移或重新提交")
+    components = task_components(data)
+    actual, _ = locked_scheme(lock)
+    reasons = []
+    for name, package in packages.items():
+        snapshot = snapshots[name]
+        wheel = locked_local_wheel(directory, directory / data["environment"]["lockfile"], package)
+        if (snapshot.get("version") != package["version"] or snapshot.get("package") != name
+                or not isinstance(snapshot.get("sha256"), str)
+                or hashlib.sha256(wheel.read_bytes()).hexdigest() != snapshot["sha256"]):
+            raise ValueError(f"任务 wheel 不符合数据库接受的准确产物：{name}")
+        if RESEARCH_PACKAGE.fullmatch(name):
+            reason = source_reason(snapshot.get("sources", {}))
             if reason:
                 reasons.append(reason)
-        elif not saved and (project is None or root.id != project.id):
-            # Installed-but-unsaved upstream wheels still bind to an active real
-            # project; saved results above never borrow its current workspace lock.
-            require_project(root)
-        wheel = locked_local_wheel(directory, directory / data["environment"]["lockfile"], packages[name])
-        if name in components:
-            if wheel != file_in_run(directory, components[name]["wheel"]):
-                raise ValueError("输入组件 wheel 与锁文件安装来源不一致")
-            validate_wheel(directory, components[name], package=name, version=packages[name]["version"], scheme=actual)
+            require_result_series(package["version"], actual)
+            component = components.get(name) or {
+                "package": name, "version": package["version"], "wheel": str(wheel),
+                "sha256": snapshot["sha256"], "entry": snapshot.get("entry"),
+            }
+            if (component.get("entry") != snapshot.get("entry") or component.get("sha256") != snapshot["sha256"]
+                    or file_in_run(directory, component["wheel"]) != wheel):
+                raise ValueError("输入组件不符合准确接受的产物快照")
+            validate_wheel(directory, component, package=name, version=package["version"], scheme=actual)
+        elif name in components:
+            raise ValueError("任务组件必须是研究产物")
         else:
-            kind = root.kind
-            symbol = "Factor" if kind == "factor" else f"{kind.title()}Algo"
-            validate_wheel(directory, {"package": name, "version": packages[name]["version"],
-                "wheel": str(wheel), "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
-                "entry": f"{name.replace('-', '_')}:{symbol}"}, package=name, version=packages[name]["version"], scheme=actual)
-    for package in packages.values():
-        source = package.get("source", {})
-        if "path" in source:
-            file_in_run(directory, str(local_lock_path((directory / data["environment"]["lockfile"]).parent, source["path"])))
-        elif "registry" in source and urlsplit(source["registry"]).scheme in {"", "file"}:
-            locked_local_wheel(directory, directory / data["environment"]["lockfile"], package)
+            try:
+                with ZipFile(wheel) as archive:
+                    files = [value for value in archive.namelist() if value.endswith(".dist-info/METADATA")]
+                    if len(files) != 1:
+                        raise ValueError("依赖 wheel 缺少唯一 METADATA")
+                    metadata = BytesParser().parsebytes(archive.read(files[0]))
+                    if canonicalize_name(metadata["Name"]) != name or metadata["Version"] != package["version"]:
+                        raise ValueError("依赖 wheel METADATA 与接受的产物身份不一致")
+            except BadZipFile as error:
+                raise ValueError("依赖 wheel 不是有效归档") from error
     return reasons
+
+
+def accepted_runtime_artifacts(record, directory: Path, kind: str) -> list[dict[str, str]]:
+    _, lockfile, lock = task_files(directory, kind)
+    snapshots = snapshot_values(getattr(record, "accepted_artifacts", None))
+    packages = local_task_packages(lock)
+    if set(packages) != set(snapshots):
+        raise ValueError("任务缺少准确接受的产物快照")
+    return [{"package": name, "version": snapshots[name]["version"], "sha256": snapshots[name]["sha256"],
+             "wheel": locked_local_wheel(directory, lockfile, package).relative_to(directory.resolve()).as_posix()}
+            for name, package in sorted(packages.items())]
 
 
 def check_task(session, record, *, project=None, directory: Path | None = None,
@@ -365,8 +510,6 @@ def check_task(session, record, *, project=None, directory: Path | None = None,
                                     input_sha256=input_sha256, lock_sha256=lock_sha256)
     actual, commit = locked_scheme(lock)
     reason = release_reason("scheme", commit=commit, version=str(actual))
-    if not reason and project is not None:
-        reason = source_reason(project_sources(project))
     if reason:
         raise VersionPolicyError(reason)
     if ((record.input_sha256 and record.input_sha256 != hashlib.sha256((directory / "input.json").read_bytes()).hexdigest())
@@ -381,29 +524,26 @@ def check_task(session, record, *, project=None, directory: Path | None = None,
         raise ValueError("记录的 ActualScheme 与冻结锁文件不一致")
     if project is not None:
         component = data["factor"] if kind == "factor" else data["algos"][kind]
-        validate_wheel(directory, component, package=f"{kind}-{project.id.hex[:4]}", version=record.package_version, scheme=actual)
+        validate_wheel(directory, component, package=package_name(project), version=record.package_version, scheme=actual)
     elif hasattr(record, "components"):
-        expected = {name for name, item in record.components.items() if item.get("version_id")}
+        expected = {name for name, item in record.components.items()
+                    if item.get("version_id") or item.get("artifact_id") or item.get("component_snapshot")}
         if set(data["algos"]) != expected:
-            raise ValueError("策略 algos 必须准确匹配数据库所选成果")
-        for name, item in record.components.items():
-            if not item.get("version_id"):
-                continue
-            from core.apps.projects.models import ProjectVersion
-
-            version = session.get(ProjectVersion, UUID(item["version_id"]))
-            if version is None:
-                raise ValueError("策略任务组件与数据库成果版本不一致")
-            from core.apps.projects.models import Project
-
-            root = session.get(Project, version.project_id)
-            if root is None or str(root.id) != item.get("project_id") or root.kind != name:
-                raise ValueError("策略任务组件与 selected rootProject 不一致")
-            component = data["algos"][name]
-            validate_wheel(directory, component, package=f"{name}-{root.id.hex[:4]}", version=version.package_version, scheme=actual)
-            original = json.loads((run_path(version.id) / "input.json").read_text(encoding="utf-8"))["algos"][name]
-            if any(component[key] != original[key] for key in ("package", "version", "entry", "sha256")):
-                raise ValueError("策略任务组件不符合所选数据库成果的准确冻结 wheel")
+            raise ValueError("策略 algos 必须准确匹配已接受的组件")
+        accepted = snapshot_values(getattr(record, "accepted_artifacts", None))
+        for stage in expected:
+            component = data["algos"][stage]
+            snapshot = accepted.get(canonicalize_name(component["package"]))
+            if snapshot is None or snapshot.get("kind") != stage:
+                raise ValueError("策略组件缺少准确接受的类型与产物快照")
+            selected_id = record.components[stage].get("artifact_id")
+            if selected_id and selected_id != (snapshot.get("artifact_id") or snapshot.get("id")):
+                raise ValueError("策略组件与所选独立产物 ID 不一致")
+            expected_component = record.components[stage].get("component_snapshot")
+            if expected_component and any(component.get(key) != expected_component.get(key)
+                                          for key in ("package", "version", "entry", "sha256")):
+                raise ValueError("策略组件与所选产物快照不一致")
+            validate_wheel(directory, component, package=snapshot["package"], version=snapshot["version"], scheme=actual)
     reasons = task_source_reasons(session, record, project, lock, directory, data)
     reason = release_reason("scheme", commit=commit, version=str(actual))
     if reason:

@@ -16,9 +16,54 @@ from config import SoloSettings
 from core.apps import version_policy as policy
 from core.apps.projects.models import Project, ProjectVersion
 from core.apps.projects.versions import version_directory
+from core.utils.uv import uv_environment
 
 KINDS = ("model", "optimize", "control", "execution")
 DEFAULTS = {"optimize": "风险平价", "control": "不拒单", "execution": "不拆单"}
+DEFAULT_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+
+def registry_policy(configs: dict, candidates: dict) -> dict:
+    """Keep Model registry policy; other results contribute only named source indexes."""
+    fields = ("name", "url", "default", "explicit", "format")
+    indexes = [{key: index[key] for key in fields if key in index}
+               for index in configs["model"].get("index", []) if index.get("format") != "flat"]
+    named = {}
+    for index in indexes:
+        name = index.get("name")
+        if name is not None:
+            if name in named:
+                raise ValueError(f"Model 含有歧义的同名 registry 索引 {name}")
+            named[name] = index
+    for kind, config in configs.items():
+        for package, location in config["sources"].items():
+            package = canonicalize_name(package)
+            if (package == "scheme" and kind != "model") or location not in candidates.get(package, []):
+                continue
+            name = location.get("index")
+            if name is None:
+                continue
+            matches = [index for index in config.get("index", []) if index.get("name") == name]
+            if len(matches) != 1 or matches[0].get("format") == "flat":
+                raise ValueError(f"依赖 {package} 的命名 registry {name} 必须对应唯一非 flat 索引")
+            index = {key: matches[0][key] for key in fields if key in matches[0]}
+            if name in named:
+                if named[name] != index:
+                    raise ValueError(f"依赖 {package} 的同名 registry 索引 {name} 配置冲突")
+            else:
+                named[name] = index
+                # Component-specific sources must not replace Model's default or search policy.
+                indexes.append({**index, "default": False, "explicit": True})
+    result = {"index": indexes}
+    if not any(index.get("default") for index in indexes):
+        for key in ("index-url", "extra-index-url"):
+            if key in configs["model"]:
+                result[key] = configs["model"][key]
+        if "index-url" not in result:
+            indexes.append({"url": DEFAULT_INDEX_URL, "default": True})
+    if "index-strategy" in configs["model"]:
+        result["index-strategy"] = configs["model"]["index-strategy"]
+    return result
 
 
 def scheme_source(components: dict) -> tuple[str, dict]:
@@ -35,7 +80,7 @@ def scheme_source(components: dict) -> tuple[str, dict]:
 def command(args: list[str], cwd: Path, data: dict | None = None) -> str:
     env = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(cwd / ".venv"),
            "UV_PYTHON_INSTALL_DIR": str(SoloSettings.HOME_DIR / ".python"),
-           "UV_CACHE_DIR": "/tmp/solo-uv-cache", "UV_LINK_MODE": "copy"}
+           **uv_environment(cwd)}
     for key in ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME"):
         env.pop(key, None)
     try:
@@ -48,14 +93,47 @@ def command(args: list[str], cwd: Path, data: dict | None = None) -> str:
     return result.stdout
 
 
-def selected(session, selections: dict[str, UUID | None]) -> dict:
+def has_component(item: dict) -> bool:
+    return bool(item.get("component") or item.get("artifact_id") or item.get("version_id"))
+
+
+def selected(session, selections: dict[str, UUID | None | dict[str, UUID]]) -> dict:
+    artifacts = selections.get("artifacts", {})
+    if not isinstance(artifacts, dict) or set(artifacts) - set(KINDS):
+        raise HTTPException(422, "已发布成果必须按策略环节选择")
+    for kind in artifacts:
+        if selections.get(kind) is not None:
+            raise HTTPException(422, f"{kind} 不能同时选择研究版本和已发布成果")
+    if selections.get("model") is None and artifacts.get("model") is None:
+        raise HTTPException(422, "请选择 Model 研究版本或已发布成果")
     result = {}
     for kind in KINDS:
+        artifact_id = artifacts.get(kind)
+        if artifact_id is not None:
+            from core.apps.artifacts.service import artifact_component
+
+            try:
+                item = dict(artifact_component(session, artifact_id))
+                if item.get("published") is False:
+                    raise ValueError("策略必须选择已发布成果")
+                component_kind = item.get("kind") or canonicalize_name(item["component"]["package"]).split("-", 1)[0]
+                if component_kind != kind:
+                    raise ValueError(f"{kind} 必须选择对应类型的已发布成果")
+                if str(item.get("artifact_id")) != str(artifact_id):
+                    raise ValueError("所选成果与 artifact_id 不一致")
+                item["version_id"] = None
+                if not isinstance(item["input"], dict):
+                    item["input"] = json.loads(Path(item["input"]).read_text(encoding="utf-8"))
+                require_components({kind: item})
+            except policy.VersionPolicyError as error:
+                raise HTTPException(422, error.detail) from error
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                raise HTTPException(422, str(error)) from error
+            result[kind] = item
+            continue
         identifier = selections.get(kind)
         if identifier is None:
-            if kind == "model":
-                raise HTTPException(422, "请选择 Model 研究版本")
-            result[kind] = {"label": DEFAULTS[kind], "version_id": None}
+            result[kind] = {"label": DEFAULTS[kind], "version_id": None, "artifact_id": None}
             continue
         version = session.get(ProjectVersion, identifier)
         project = session.get(Project, version.project_id) if version else None
@@ -67,15 +145,17 @@ def selected(session, selections: dict[str, UUID | None]) -> dict:
             raise HTTPException(422, error.detail) from error
         source = json.loads((version_directory(version) / "input.json").read_text())
         component = source["algos"][kind]
+        snapshots = getattr(version, "accepted_artifacts", None) or {}
+        root_snapshot = snapshots.get(canonicalize_name(component["package"]), {})
         result[kind] = {"label": f"{project.name} · v{version.number}", "project_id": str(project.id),
-                        "version_id": str(version.id), "scheme_version": version.scheme_version,
-                        "root_sources": policy.project_sources(project),
-                        "component": component, "input": source}
+                        "version_id": str(version.id), "artifact_id": None, "scheme_version": version.scheme_version,
+                        "root_sources": root_snapshot.get("sources") or policy.project_sources(project),
+                        "accepted_artifacts": snapshots, "component": component, "input": source}
     scheme = Version(result["model"]["scheme_version"])
     if scheme.major != 1:
         raise HTTPException(422, "当前策略组装支持 Scheme 1.x")
     for item in result.values():
-        if item["version_id"]:
+        if has_component(item):
             version = Version(item["scheme_version"])
             if (version.major, version.minor) != (scheme.major, scheme.minor):
                 raise HTTPException(422, "各环节必须使用同一 Scheme 主、次版本")
@@ -86,7 +166,7 @@ def require_components(components: dict) -> None:
     """Guard direct form/build calls too, using each result's own frozen environment."""
     series = None
     for item in components.values():
-        if not item["version_id"]:
+        if not has_component(item):
             continue
         reason = policy.source_reason(item.get("root_sources", {}))
         if reason:
@@ -107,14 +187,15 @@ def require_components(components: dict) -> None:
 def inspect_component(components: dict, kind: str, values: dict | None = None, common: dict | None = None) -> dict:
     require_components(components)
     item = components[kind]
-    source = item if item["version_id"] else components["model"]
+    source = item if has_component(item) else components["model"]
     environment = Path(source["input"]["environment"]["lockfile"]).parent
     command(["uv", "sync", "--project", str(environment), "--locked", "--no-dev"], environment)
     data = {"kind": kind, "entry": item.get("component", {}).get("entry"),
-            "saved": source["input"]["backtest"] if item["version_id"] else {}}
+            "saved": source["input"].get("backtest", {}) if has_component(item) else {}}
     if values is not None:
         data.update(values=values, common=common or {}, entries={key: value.get("component", {}).get("entry") for key, value in components.items()})
-    output = command([str(environment / ".venv/bin/python"), str(Path(__file__).with_name("parameters.py"))], environment, data)
+    python = environment / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    output = command([str(python), str(Path(__file__).with_name("parameters.py"))], environment, data)
     return json.loads(output.splitlines()[-1])
 
 
@@ -136,18 +217,20 @@ def build(components: dict, forms: dict, destination: Path) -> str:
             parameters[key] = value
     backtest.update(parameters)
     scheme_version, scheme_location = scheme_source(components)
-    candidates, roots, algos = {}, [], {}
+    candidates, roots, algos, configs = {}, [], {}, {}
     destination.mkdir(parents=True, exist_ok=False)
     for kind, item in components.items():
-        if not item["version_id"]:
+        if not has_component(item):
             continue
-        component = item["component"].copy()
+        # StrategyTask.algos uses Scheme's strict Package, not registry provenance or Factor params.
+        component = {key: item["component"][key] for key in ("package", "version", "wheel", "sha256", "entry")}
         wheel = Path(component["wheel"])
         if hashlib.sha256(wheel.read_bytes()).hexdigest() != component["sha256"]:
             raise ValueError(f"{kind} wheel 哈希不一致")
         environment = Path(item["input"]["environment"]["lockfile"]).parent
         config = tomllib.loads((environment / "pyproject.toml").read_text())
-        for name, location in config["tool"]["uv"]["sources"].items():
+        configs[kind] = config["tool"]["uv"]
+        for name, location in configs[kind]["sources"].items():
             name = canonicalize_name(name)
             if name != "scheme":
                 location = location.copy()
@@ -164,7 +247,8 @@ def build(components: dict, forms: dict, destination: Path) -> str:
     candidates["scheme"] = [scheme_location]
     roots.append(f"scheme=={scheme_version}")
     # 所有本地 wheel 都复制到本次策略目录，运行不再依赖项目工作区。
-    sources, indexes = {}, []
+    registry = registry_policy(configs, candidates)
+    sources, indexes = {}, registry["index"]
     for name, locations in candidates.items():
         if any("directory" in location or "editable" in location for location in locations):
             raise ValueError("版本环境含有未冻结的目录依赖")
@@ -187,6 +271,8 @@ def build(components: dict, forms: dict, destination: Path) -> str:
             sources[name] = {"path": str(target)}
         else:
             index = f"wheels-{name}"
+            if any(item.get("name") == index for item in indexes):
+                raise ValueError(f"本地 wheel 索引 {index} 与继承的 registry 名称冲突")
             indexes.append({"name": index, "url": str(directory), "format": "flat"})
             sources[name] = {"index": index}
     for component in algos.values():
@@ -196,7 +282,7 @@ def build(components: dict, forms: dict, destination: Path) -> str:
     (environment / "pyproject.toml").write_text(tomlkit.dumps({
         "project": {"name": "strategy-environment", "version": "0.0.0", "requires-python": ">=3.12,<3.13", "dependencies": roots},
         # uv 仅对项目依赖及约束中的包应用 sources；间接依赖也需保留来源，但不继承旧锁版本。
-        "tool": {"uv": {"package": False, "sources": sources, "index": indexes,
+        "tool": {"uv": {"package": False, "sources": sources, **registry,
                         "constraint-dependencies": list(sources)}},
     }))
     command(["uv", "lock", "--project", str(environment)], environment)

@@ -17,6 +17,31 @@ class DolphinSchedulerError(RuntimeError):
         self.submission_unknown = submission_unknown
 
 
+class DolphinSchedulerBusyError(DolphinSchedulerError):
+    """An owned instance has not reached a terminal scheduler state."""
+
+
+FINISHED_STATES = frozenset({"SUCCESS", "FAILURE", "STOP", "PAUSE", "BLOCK"})
+
+
+def instance_input_file(instance: dict[str, Any]) -> str | None:
+    """Read the accepted input parameter, never a task log or an instance name."""
+    try:
+        parameters = instance.get("globalParams") or "[]"
+        if isinstance(parameters, str):
+            parameters = json.loads(parameters)
+        if not isinstance(parameters, list) or any(not isinstance(item, dict) for item in parameters):
+            raise ValueError
+        values = [item.get("value") for item in parameters if item.get("prop") == "input_file"]
+        if not values:
+            return None
+        if len(values) != 1 or not isinstance(values[0], str):
+            raise ValueError
+        return values[0]
+    except (TypeError, ValueError) as error:
+        raise DolphinSchedulerError("DolphinScheduler 实例输入身份不完整，未执行删除") from error
+
+
 def validate_input_file(input_file: str) -> str:
     """DS 会把参数替换进 Shell，因此只接受共享目录内的安全绝对路径。"""
     path = PurePosixPath(input_file)
@@ -83,6 +108,8 @@ class DolphinSchedulerClient:
                     )
                 ),
             ) from error
+        if not isinstance(payload, dict):
+            raise DolphinSchedulerError("DolphinScheduler 响应格式无效")
         if not payload.get("success", payload.get("code") == 0):
             raise DolphinSchedulerError(
                 f"DolphinScheduler：{payload.get('msg', '未知错误')}"
@@ -137,6 +164,91 @@ class DolphinSchedulerClient:
             },
         )
         return result.get("totalList") or []
+
+    def instance_index(self, kind: str) -> tuple[int, int, list[dict[str, Any]]]:
+        """Inventory the shared DS project, not just one definition, to prove ID absence."""
+        project = self.project_code()
+        definition = int(self.definition(project, kind)["code"])
+        instances: list[dict[str, Any]] = []
+        identifiers: set[int] = set()
+        total = None
+        for page in range(1, 101):
+            result = self.request("GET", f"/projects/{project}/process-instances", {
+                "processDefineCode": 0, "pageNo": page, "pageSize": 100,
+            })
+            if (not isinstance(result, dict) or not isinstance(result.get("totalList"), list)
+                    or type(result.get("total")) is not int or result["total"] < 0):
+                raise DolphinSchedulerError("DolphinScheduler 实例列表不完整，未执行删除")
+            if total is not None and total != result["total"]:
+                raise DolphinSchedulerError("DolphinScheduler 实例列表发生变化，请重试")
+            total = result["total"]
+            items = result["totalList"]
+            for item in items:
+                if (not isinstance(item, dict) or type(item.get("id")) is not int
+                        or item["id"] <= 0 or item["id"] in identifiers
+                        or type(item.get("processDefinitionCode")) is not int
+                        or item["processDefinitionCode"] <= 0):
+                    raise DolphinSchedulerError("DolphinScheduler 实例身份不完整，未执行删除")
+                identifiers.add(item["id"])
+                instances.append(item)
+            if len(instances) == total:
+                return project, definition, instances
+            if not items or len(instances) > total:
+                break
+        raise DolphinSchedulerError("DolphinScheduler 实例列表未读取完整，未执行删除")
+
+    @staticmethod
+    def require_owned_instance(instance: dict[str, Any], *, project: int, definition: int,
+                               instance_id: int, input_file: str) -> None:
+        if (not isinstance(instance, dict) or instance.get("id") != instance_id
+                or instance.get("processDefinitionCode") != definition
+                or instance.get("projectCode", project) != project
+                or instance_input_file(instance) != input_file):
+            raise DolphinSchedulerError("DolphinScheduler 实例不属于该研究任务，未执行删除")
+        state = instance.get("state")
+        if not isinstance(state, str):
+            raise DolphinSchedulerError("DolphinScheduler 实例状态不完整，未执行删除")
+        if state not in FINISHED_STATES:
+            raise DolphinSchedulerBusyError("研究任务在 DolphinScheduler 中仍未结束，不能删除")
+
+    def owned_instances(self, kind: str, input_files: set[str],
+                        known_instances: dict[int, str]) -> list[dict[str, Any]]:
+        project, definition, instances = self.instance_index(kind)
+        owned = []
+        for instance in instances:
+            input_file = instance_input_file(instance)
+            if instance["id"] in known_instances:
+                if input_file != known_instances[instance["id"]]:
+                    raise DolphinSchedulerError("DolphinScheduler 任务 ID 与输入身份不一致，未执行删除")
+            elif input_file not in input_files:
+                continue
+            self.require_owned_instance(instance, project=project, definition=definition,
+                                        instance_id=instance["id"], input_file=input_file)
+            owned.append({"id": instance["id"], "kind": kind, "project": project,
+                          "definition": definition, "input_file": input_file})
+        return owned
+
+    def delete_owned_instance(self, owned: dict[str, Any]) -> None:
+        """DS 3.2 DELETE removes the instance/tasks; verify ownership and absence via API."""
+        project, definition, instances = self.instance_index(owned["kind"])
+        if project != owned["project"] or definition != owned["definition"]:
+            raise DolphinSchedulerError("DolphinScheduler 工作流身份已改变，未执行删除")
+        instance = next((item for item in instances if item["id"] == owned["id"]), None)
+        if instance is None:
+            return  # Complete inventory proved a previous DELETE already completed.
+        expected = {"project": project, "definition": definition,
+                    "instance_id": owned["id"], "input_file": owned["input_file"]}
+        self.require_owned_instance(instance, **expected)
+        path = f"/projects/{project}/process-instances/{owned['id']}"
+        detail = self.request("GET", path)
+        self.require_owned_instance(detail, **expected)
+        result = self.request("DELETE", path)
+        if result is not None and result is not True:
+            raise DolphinSchedulerError("DolphinScheduler 未确认实例删除，请重试")
+        after_project, after_definition, remaining = self.instance_index(owned["kind"])
+        if (after_project != project or after_definition != definition
+                or any(item["id"] == owned["id"] for item in remaining)):
+            raise DolphinSchedulerError("DolphinScheduler 实例删除未完成，请重试")
 
     def instance(self, instance_id: int) -> dict[str, Any]:
         project = self.project_code()

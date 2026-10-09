@@ -12,6 +12,7 @@ from alembic import context
 from core.database.base import Base
 from core.apps.projects import models  # noqa: F401
 from core.apps.strategies import models as strategy_models  # noqa: F401
+from core.apps.artifacts import models as artifact_models  # noqa: F401
 from core.database.session import sqlalchemy_database_url
 
 VERSION_TABLE = "alembic_version_backend"

@@ -29,6 +29,7 @@ def submission(tmp_path, monkeypatch):
     session.scalar.return_value = version
     session.get.return_value = SimpleNamespace(id=version.project_id, kind="factor", archived=False, scheme_version="v1.2.0",
                                                scheme_commit="b" * 40, template_tag="v1.2.0", template_commit="a" * 40)
+    session.get.side_effect = lambda model, identifier: None if model is versions.ProjectDeletion else session.get.return_value
     directory = tmp_path / "runs" / str(version.id)
     directory.mkdir(parents=True)
     monkeypatch.setattr(SoloSettings, "SHARED_DIR", tmp_path)
@@ -53,6 +54,16 @@ def submission(tmp_path, monkeypatch):
         "environment": {"lockfile": str(directory / "uv.lock")}, "analysis": {},
     }), encoding="utf-8")
     (directory / "build.json").write_text('{"scheme_version":"1.2.0"}', encoding="utf-8")
+
+    def capture(database, record, *, project, directory, kind):
+        data = json.loads((directory / "input.json").read_text())
+        component = data["factor"] if kind == "factor" else data["algos"][kind]
+        return {component["package"]: {
+            **{key: component[key] for key in ("package", "version", "entry", "sha256")},
+            "kind": kind, "sources": versions.policy.project_sources(project), "scheme_version": "1.2.0",
+        }}
+
+    monkeypatch.setattr(versions.policy, "capture_task_artifacts", capture)
     return version, session, factory, client, directory
 
 
@@ -72,6 +83,7 @@ def test_create_version_uses_actual_locked_scheme_series(tmp_path, monkeypatch, 
     monkeypatch.setattr(versions, "read_version", lambda version: {"packageVersion": version.package_version})
     session = MagicMock()
     session.scalar.side_effect = [project, None, previous_number]
+    session.get.return_value = None
     result = versions.create_version(project.id, versions.CreateVersion(note="保存"), session)
     version = session.add.call_args.args[0]
     assert result["packageVersion"] == f"{series}.{previous_number + 1}"
@@ -98,6 +110,7 @@ def test_create_version_rejects_missing_or_ambiguous_scheme_lock(tmp_path, monke
     monkeypatch.setattr(versions, "project_directory", lambda _: tmp_path)
     session = MagicMock()
     session.scalar.side_effect = [project, None, None]
+    session.get.return_value = None
     with pytest.raises(HTTPException) as error:
         versions.create_version(project.id, versions.CreateVersion(), session)
     assert error.value.status_code == 422
