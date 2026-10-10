@@ -1,6 +1,7 @@
 """读取 Gitee Tag，并从对应 commit 归档复制指定模板目录。"""
 
 import json
+import os
 import re
 import stat
 import subprocess
@@ -48,6 +49,43 @@ def gitee_get(path: str, repository: str | None = None) -> requests.Response:
         raise TemplateError("无法读取 Gitee 模板仓库，请稍后重试或检查网络及 Gitee 访问额度") from error
 
 
+def git_output(*arguments: str) -> bytes:
+    return subprocess.run(
+        ["git", *arguments], check=True, capture_output=True, timeout=120,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    ).stdout
+
+
+def git_versions(repository: str) -> list[TemplateVersion]:
+    """REST API 配额不足时，经 Git 协议读取同一组 Tag 及其提交。"""
+    try:
+        output = git_output("ls-remote", "--tags", f"https://gitee.com/{repository}.git").decode("utf-8")
+    except (OSError, subprocess.SubprocessError, UnicodeError) as error:
+        raise TemplateError("无法读取 Gitee 模板仓库，请稍后重试或检查网络") from error
+    commits: dict[str, str] = {}
+    for line in output.splitlines():
+        commit, _, reference = line.partition("\t")
+        tag = reference.removeprefix("refs/tags/")
+        if tag.endswith("^{}"):
+            commits[tag.removesuffix("^{}")] = commit  # 附注 Tag 取其指向的提交。
+        else:
+            commits.setdefault(tag, commit)
+    return [TemplateVersion(tag=tag, commit=commit) for tag, commit in commits.items()]
+
+
+def git_file(repository: str, commit: str, path: str) -> bytes:
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise TemplateError("模板 commit 无效")
+    try:
+        with TemporaryDirectory(prefix="solo-template-") as temporary:
+            git_output("-C", temporary, "init", "--bare")
+            git_output("-C", temporary, "fetch", "--depth=1", "--no-tags",
+                       f"https://gitee.com/{repository}.git", commit)
+            return git_output("-C", temporary, "show", f"FETCH_HEAD:{path}")
+    except (OSError, subprocess.SubprocessError) as error:
+        raise TemplateError("无法从 Gitee 读取版本文件，请检查网络后重试") from error
+
+
 def version_key(version: TemplateVersion) -> tuple[int, int, int, int, bool, str]:
     match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(.*)", version.tag)
     if match:
@@ -62,12 +100,15 @@ def repository_versions(repository: str, refresh: bool = False) -> list[Template
             return list(cached[1])
         versions: list[TemplateVersion] = []
         page = 1
-        while True:
-            data = gitee_get(f"tags?per_page=100&page={page}", repository).json()
-            versions.extend(TemplateVersion(tag=item["name"], commit=item["commit"]["sha"]) for item in data)
-            if len(data) < 100:
-                break
-            page += 1
+        try:
+            while True:
+                data = gitee_get(f"tags?per_page=100&page={page}", repository).json()
+                versions.extend(TemplateVersion(tag=item["name"], commit=item["commit"]["sha"]) for item in data)
+                if len(data) < 100:
+                    break
+                page += 1
+        except TemplateError:
+            versions = git_versions(repository)
         versions.sort(key=version_key, reverse=True)
         _cache[repository] = (monotonic(), versions)
         return list(versions)
@@ -75,8 +116,11 @@ def repository_versions(repository: str, refresh: bool = False) -> list[Template
 
 @lru_cache(maxsize=256)
 def project_metadata(repository: str, commit: str, path: str) -> dict:
-    response = gitee_get(f"contents/{path}?ref={commit}", repository).json()
-    return tomllib.loads(b64decode(response["content"]).decode("utf-8"))["project"]
+    try:
+        content = b64decode(gitee_get(f"contents/{path}?ref={commit}", repository).json()["content"])
+    except TemplateError:
+        content = git_file(repository, commit, path)
+    return tomllib.loads(content.decode("utf-8"))["project"]
 
 
 def list_scheme_versions(refresh: bool = False) -> list[TemplateVersion]:
@@ -196,12 +240,42 @@ def unpack_template(content: bytes, kind: ProjectKind, destination: Path, packag
     old_module = old_package.replace("-", "_")
     new_package = f"{kind}-{package_suffix}"
     new_module = new_package.replace("-", "_")
+    module_import = re.compile(rf"\b(from\s+|import\s+)({re.escape(old_module)})(?=[.\s,]|$)")
+
+    def rename_imports(source: str | list[str]) -> str | list[str]:
+        text = source if isinstance(source, str) else "".join(source)
+        renamed = module_import.sub(lambda match: match[1] + new_module, text)
+        if isinstance(source, str):
+            return renamed
+        # 在连接后的源码中匹配跨段 import，再映射原边界；不拆散行或丢失空段。
+        matches = iter(module_import.finditer(text))
+        match = next(matches, None)
+        result = []
+        offset = delta = previous = 0
+        for part in source:
+            offset += len(part)
+            while match is not None and match.end() <= offset:
+                delta += len(new_module) - len(old_module)
+                match = next(matches, None)
+            boundary = offset + delta
+            if match is not None and match.start(2) < offset:
+                boundary -= max(0, offset - match.start(2) - len(new_module))
+            result.append(renamed[previous:boundary])
+            previous = boundary
+        return result
+
     # 每个研究项目有独立包名和模块名，可同时安装多个同类成果。
     for file in destination.rglob("*"):
         if file.is_file() and file.suffix in {".py", ".toml", ".ipynb", ".md"}:
             text = file.read_text(encoding="utf-8")
-            text = re.sub(rf"\b(from\s+|import\s+){re.escape(old_module)}(?=[.\s,]|$)",
-                          lambda match: match[1] + new_module, text)
+            if file.suffix == ".ipynb":
+                notebook_data = json.loads(text)
+                for cell in notebook_data.get("cells", []):
+                    if cell.get("cell_type") == "code" and isinstance(cell.get("source"), (str, list)):
+                        cell["source"] = rename_imports(cell["source"])
+                text = json.dumps(notebook_data, ensure_ascii=False, indent=2)
+            else:
+                text = rename_imports(text)
             file.write_text(text, encoding="utf-8")
     document = tomlkit.parse(pyproject.read_text(encoding="utf-8"))
     document["project"]["name"] = new_package
@@ -210,16 +284,6 @@ def unpack_template(content: bytes, kind: ProjectKind, destination: Path, packag
     if module.is_dir():
         module.rename(module.with_name(new_module))
     notebook_data = json.loads(notebook.read_text(encoding="utf-8"))
-    title = {"factor": "因子研究", "model": "策略建模研究", "optimize": "组合优化研究",
-             "control": "订单风控研究", "execution": "算法下单研究"}[kind]
-    prefix = kind.title()
-    exports = "Factor, FactorAnalysisParams, FactorReportForm" if kind == "factor" else f"{prefix}Algo, {prefix}AnalysisParams, {prefix}ReportForm"
-    notebook_data["cells"] = [
-        {"cell_type": "markdown", "id": "research-title", "metadata": {}, "source": [f"# {title}"]},
-        {"cell_type": "code", "id": "research-imports", "execution_count": None, "metadata": {},
-         "outputs": [], "source": [f"from {new_module} import {exports}"]},
-        {"cell_type": "code", "id": "research-work", "execution_count": None, "metadata": {}, "outputs": [], "source": []},
-    ]
     notebook_data.setdefault("nbformat", 4)
     notebook_data.setdefault("nbformat_minor", 5)
     notebook.write_text(json.dumps(notebook_data, ensure_ascii=False, indent=2), encoding="utf-8")

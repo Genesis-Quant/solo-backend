@@ -35,6 +35,8 @@ Docker Compose 由上一级 Solo 工作区维护。`alembic upgrade head` 在 `s
 
 Scheme 和 Algo 模板版本列表均返回 Tag、commit 和 `pyproject.toml` 中的实际 `version`，前端根据实际版本判断是否支持。自定义 Tag 不必等于包版本；退役先匹配明确的 Tag/commit 身份，再以对应 commit 的实际版本校验。新项目保存验证过的 `template_package_version`，迁移 `0006_project_template_version` 仅增加该可空列，不回填历史项目。
 
+创建项目时保留所选 Tag 中 `research.ipynb` 的所有单元、参数、运行/报告代码和元数据，只将当前项目的包导入替换为独立模块名；不清空或重建单元列表，不执行 Notebook。Kernel 仍单独注册到该项目的冻结环境。Notebook 交互运行与“保存版本”的正式调度任务是两条独立入口。
+
 ## 版本退役与准入
 
 政策唯一来源为 `version-policy.json`。Scheme 0.1.0、1.0.0、1.0.1、1.1.0 以及 Algo 模板 0.1.0、1.0.0、1.0.1 已退役，最低活跃版本为 1.2.0。Tag/commit 是发布身份；候选成果的 `packageVersion` 由实际锁定的 Scheme 主次版本和项目内提交编号生成，不把成果编号当模板 Tag。退役本身不迁移或删除目录、历史记录、冻结资产和报告；用户明确删除项目时，仍按项目生命周期清理所属资源。
@@ -53,7 +55,7 @@ Scheme 和 Algo 模板版本列表均返回 Tag、commit 和 `pyproject.toml` �
 
 目录使用 `/shared/projects/model/动量策略`，根目录 `.solo` 保存 `project_id`、`package_name`、`name`、`kind`、Scheme 和 Algo 创建来源。同类活动项目名称唯一；彻底删除后允许用相同名称创建新 UUID 的项目。`DELETE /projects/{id}` 默认 `delete_files=true`：删除项目及研究版本记录、所属 `runs/{version UUID}`（包含报告、冻结源与虚拟环境）、专属 Kernel 注册和准确匹配的 DolphinScheduler 实例，回收没有引用的未发布产物。已发布 wheel 和独立下游任务的冻结副本不受影响。`delete_files=false` 只保留 Jupyter 工作区，仍删除项目记录及所属任务；保留的物理目录会阻止同名覆盖。正在构建/运行或读取项目源码时返回 409，不能删掉使用中的资源；空闲的专属会话/Kernel 可以正常关闭。清理失败返回 `project_cleanup_incomplete`，可用原项目 UUID 重试，绝不访问后来创建的同名项目。
 
-Backend 和 Jupyter 需要挂载相同的 `/shared/projects`、`/shared/runs`、`/home/jovyan/.python` 和 `/home/jovyan/.jupyter/kernels`，并将 `HOME` 设置为 `/home/jovyan`。独立产物卷只挂载到 Backend 的 `/shared/artifacts`；Jupyter 通过产物 API 下载并验证 wheel，不直接访问产物库或源项目目录。Backend 使用 Git、uv 创建 Python 3.12 环境；Jupyter 设置 `JUPYTER_PATH=/home/jovyan/.jupyter` 发现项目 Kernel。模板仓库固定为 `genesis-quant/solo-algos`；可通过 `GITEE_TOKEN` 增加 Gitee API 额度。`JUPYTER_URL` 配置浏览器入口，`JUPYTER_API_URL` 配置服务间地址，`JUPYTER_TOKEN` 用于认证，不写入项目文件。
+Backend 和 Jupyter 需要挂载相同的 `/shared/projects`、`/shared/runs`、`/home/jovyan/.python` 和 `/home/jovyan/.jupyter/kernels`，并将 `HOME` 设置为 `/home/jovyan`。独立产物卷只挂载到 Backend 的 `/shared/artifacts`；Jupyter 通过产物 API 下载并验证 wheel，不直接访问产物库或源项目目录。Backend 使用 Git、uv 创建 Python 3.12 环境；Jupyter 设置 `JUPYTER_PATH=/home/jovyan/.jupyter` 发现项目 Kernel。模板仓库固定为 `genesis-quant/solo-algos`；可通过 `GITEE_TOKEN` 增加 Gitee API 额度，API 配额不足时自动经 Git 协议读取同一 Tag 及其提交中的版本文件。`JUPYTER_URL` 配置浏览器入口，`JUPYTER_API_URL` 配置服务间地址，`JUPYTER_TOKEN` 用于认证，不写入项目文件。
 
 ## 独立产物与冻结任务
 
