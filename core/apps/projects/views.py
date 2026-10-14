@@ -3,7 +3,7 @@ import shutil
 import tempfile
 import tomllib
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, TypeAlias
 from urllib.parse import quote, urlencode
 from uuid import UUID, uuid4
 
@@ -30,7 +30,7 @@ from .schemas import (
 )
 
 router = APIRouter(prefix="/api/v1", tags=["projects"])
-type Database = Annotated[Session, Depends(get_database_session)]
+Database: TypeAlias = Annotated[Session, Depends(get_database_session)]
 
 
 def project_directory(project: Project) -> Path:

@@ -1,6 +1,6 @@
 """Public read-only policy and database-bound admission checks."""
 
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TypeAlias
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -13,7 +13,7 @@ from core.apps.strategies.models import Strategy
 from core.database.session import get_database_session
 
 router = APIRouter(prefix="/api/v1/version-policy", tags=["version-policy"])
-type Database = Annotated[Session, Depends(get_database_session)]
+Database: TypeAlias = Annotated[Session, Depends(get_database_session)]
 
 
 class TaskCheck(BaseModel):

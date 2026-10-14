@@ -1,10 +1,10 @@
 from datetime import datetime
-from typing import Literal
+from typing import Literal, TypeAlias
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-type ProjectKind = Literal["factor", "model", "optimize", "control", "execution"]
+ProjectKind: TypeAlias = Literal["factor", "model", "optimize", "control", "execution"]
 
 
 class ProjectEdit(BaseModel):

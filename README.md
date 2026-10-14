@@ -13,6 +13,12 @@ uv run uvicorn main:app --host 127.0.0.1 --port 8010 --reload
 
 健康检查：`/health`、`/api/v1/health`；接口文档：`/docs`。
 
+## 0.1.1 启动就绪与传统类型别名
+
+同步工作流前等待 Python Gateway，总期限为 60 秒并覆盖 DNS 解析和多地址连接；只重试连接探测，不重试用户创建、项目创建或工作流提交。无法中断的系统 DNS 由守护线程收尾，迟到成功不放行同步，迟到连接仍关闭。根目录 Compose 同时检查调度器 HTTP 和 Gateway 监听状态，避免 Backend 早于 Gateway 启动。
+
+API 类型别名改用 `TypeAlias`，依赖注入、请求校验和响应数据不变；OpenAPI 中 `ProjectKind` 枚举由命名引用改为内联枚举。
+
 任务日志分页和下载仅通过 DolphinScheduler HTTP API 获取。Backend 不挂载或读取调度器日志文件；调度器无法获取日志时，接口返回 502 和调度器错误，不伪装成 Backend 断连或空日志。
 
 ```powershell

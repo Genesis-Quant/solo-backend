@@ -30,7 +30,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         database_engine().dispose()
 
 
-app = FastAPI(title="Solo Backend", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Solo Backend", version="0.1.1", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=SoloSettings.WEB_ORIGINS,

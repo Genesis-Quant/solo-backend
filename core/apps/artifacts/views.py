@@ -5,7 +5,7 @@ import json
 import tomllib
 from copy import deepcopy
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, TypeAlias
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -28,7 +28,7 @@ from .service import (INSTALLATION_TTL, ArtifactError, artifact_path, checked_pa
                       register_file, require_artifact, require_installation, require_settled_installations)
 
 router = APIRouter(prefix="/api/v1", tags=["artifacts"])
-type Database = Annotated[Session, Depends(get_database_session)]
+Database: TypeAlias = Annotated[Session, Depends(get_database_session)]
 
 
 class RegisterArtifact(BaseModel):
