@@ -26,6 +26,12 @@ class ProjectCreate(ProjectEdit):
     algo_version: str = Field(min_length=1, max_length=128)
 
 
+class ProjectUpgrade(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    scheme_version: str = Field(min_length=1, max_length=128)
+    algo_version: str = Field(min_length=1, max_length=128)
+
+
 class TemplateVersion(BaseModel):
     tag: str
     commit: str

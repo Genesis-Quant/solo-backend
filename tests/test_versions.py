@@ -1,21 +1,24 @@
 """保存任务中断、调度重试和重复请求的状态回归。"""
 
-import hashlib
 import json
+from copy import deepcopy
 from datetime import UTC, datetime
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 from zipfile import ZipFile
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy.orm import Session
 
 from config import SoloSettings
+from core.apps.artifacts.service import artifact_snapshot, register_file
 from core.apps.projects import versions
-from core.apps.projects.models import ProjectVersion
+from core.apps.projects.models import Project, ProjectVersion
 from core.scheduler.client import DolphinSchedulerError
+from test_artifacts import make_project, make_run, make_wheel
+from test_projects import create_cleanup_project, projects_client  # noqa: F401 -- imported pytest fixture
 
 
 @pytest.fixture
@@ -27,8 +30,8 @@ def submission(tmp_path, monkeypatch):
     )
     session = MagicMock()
     session.scalar.return_value = version
-    session.get.return_value = SimpleNamespace(id=version.project_id, kind="factor", archived=False, scheme_version="v1.2.0",
-                                               scheme_commit="b" * 40, template_tag="v1.2.0", template_commit="a" * 40)
+    session.get.return_value = SimpleNamespace(id=version.project_id, name="submission", kind="factor", archived=False, scheme_version="v1.2.0",
+                                               scheme_commit="b" * 40, template_tag="v1.2.0", template_commit="a" * 40, template_package_version="1.2.0", package_name=f"factor-{version.project_id.hex[:4]}")
     session.get.side_effect = lambda model, identifier: None if model is versions.ProjectDeletion else session.get.return_value
     directory = tmp_path / "runs" / str(version.id)
     directory.mkdir(parents=True)
@@ -50,7 +53,7 @@ def submission(tmp_path, monkeypatch):
     (directory / "input.json").write_text(json.dumps({
         "kind": "factor",
         "factor": {"package": package, "version": "1.2.1", "wheel": str(wheel), "params": {},
-                   "entry": f"{package.replace('-', '_')}:Factor", "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest()},
+                   "entry": f"{package.replace('-', '_')}:Factor"},
         "environment": {"lockfile": str(directory / "uv.lock")}, "analysis": {},
     }), encoding="utf-8")
     (directory / "build.json").write_text('{"scheme_version":"1.2.0"}', encoding="utf-8")
@@ -59,7 +62,7 @@ def submission(tmp_path, monkeypatch):
         data = json.loads((directory / "input.json").read_text())
         component = data["factor"] if kind == "factor" else data["algos"][kind]
         return {component["package"]: {
-            **{key: component[key] for key in ("package", "version", "entry", "sha256")},
+            **{key: component[key] for key in ("package", "version", "entry")},
             "kind": kind, "sources": versions.policy.project_sources(project), "scheme_version": "1.2.0",
         }}
 
@@ -74,8 +77,10 @@ def submit(version, session):
 @pytest.mark.parametrize("scheme_version,series", [("1.2.0", "1.2"), ("1.2.7", "1.2"), ("1.2.99", "1.2")])
 @pytest.mark.parametrize("previous_number", [0, 7])
 def test_create_version_uses_actual_locked_scheme_series(tmp_path, monkeypatch, scheme_version, series, previous_number):
-    project = SimpleNamespace(id=uuid4(), archived=False, scheme_version="v9.9.9", scheme_commit="b" * 40,
-                              template_tag="v1.2.0", template_commit="a" * 40)
+    project = SimpleNamespace(id=uuid4(), name="create-version", kind="factor", archived=False,
+                              scheme_version="v9.9.9", scheme_commit="b" * 40,
+                              template_tag="v1.2.0", template_commit="a" * 40, template_package_version="1.2.0")
+    monkeypatch.setattr(SoloSettings, "SHARED_DIR", tmp_path)
     lock = tmp_path / "uv.lock"
     original = f'[[package]]\nname="scheme"\nversion="{scheme_version}"\n'
     lock.write_text(original, encoding="utf-8")
@@ -103,8 +108,10 @@ def test_create_version_uses_actual_locked_scheme_series(tmp_path, monkeypatch, 
     )],
 ])
 def test_create_version_rejects_missing_or_ambiguous_scheme_lock(tmp_path, monkeypatch, content):
-    project = SimpleNamespace(id=uuid4(), archived=False, scheme_version="v1.2.0", scheme_commit="b" * 40,
-                              template_tag="v1.2.0", template_commit="a" * 40)
+    project = SimpleNamespace(id=uuid4(), name="invalid-lock", kind="factor", archived=False,
+                              scheme_version="v1.2.0", scheme_commit="b" * 40,
+                              template_tag="v1.2.0", template_commit="a" * 40, template_package_version="1.2.0")
+    monkeypatch.setattr(SoloSettings, "SHARED_DIR", tmp_path)
     if content is not None:
         (tmp_path / "uv.lock").write_text(content, encoding="utf-8")
     monkeypatch.setattr(versions, "project_directory", lambda _: tmp_path)
@@ -148,7 +155,6 @@ def test_failed_build_callback_records_failure_without_release_admission(submiss
     assert result["phase"] == "failed"
     assert result["error"] == "后台准入检查失败，未执行构建"
     assert version.finished_at is not None
-    assert version.input_sha256 is None and version.lock_sha256 is None
     session.commit.assert_called_once()
     factory.assert_not_called()
     assert {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()} == before
@@ -166,9 +172,97 @@ def test_successful_build_callback_still_rejects_retired_execution(submission, s
         submit(version, session)
     assert error.value.status_code == 422
     assert error.value.detail["code"] == "version_retired"
-    assert version.status == "building"
-    session.commit.assert_not_called()
+    assert version.status == "failed" and version.error == error.value.detail["reason"]
+    assert version.finished_at is not None
+    session.commit.assert_called_once()
     factory.assert_not_called()
+    assert submit(version, session)["phase"] == "failed"
+    session.commit.assert_called_once()
+
+
+def test_retry_submission_rechecks_retired_frozen_scheme_without_recapturing_artifacts(submission):
+    version, session, factory, _, directory = submission
+    version.status = "submit_failed"
+    version.accepted_artifacts = {"previous": {"package": "factor-abcd"}}
+    lockfile = directory / "uv.lock"
+    lockfile.write_text('[[package]]\nname="scheme"\nversion="1.2.0"\nsource={git="https://example.invalid/scheme#'
+                        + versions.policy.load_policy()["retired_releases"]["scheme"][0]["commit"] + '"}\n')
+    with pytest.raises(HTTPException) as error:
+        submit(version, session)
+    assert error.value.status_code == 422 and error.value.detail["code"] == "version_retired"
+    assert version.status == "failed" and version.error == error.value.detail["reason"]
+    assert version.finished_at is not None
+    assert version.accepted_artifacts == {"previous": {"package": "factor-abcd"}}
+    factory.assert_not_called()
+    session.commit.assert_called_once()
+
+
+@pytest.mark.parametrize("failure,reason", [
+    ("kind", "研究类型与项目不一致"), ("package-version", "候选包版本或研究类型不一致"),
+    ("missing-input", "构建产物不完整"), ("invalid-input", "构建产物不完整"),
+    ("missing-wheel", "任务产物不在版本目录中"), ("missing-lock", "任务产物不在版本目录中"),
+    ("actual-scheme", "build.json ActualScheme 与冻结锁文件不一致"),
+    ("result-series", "候选成果必须使用实际 Scheme 的主、次版本"),
+    ("retired-scheme", "已退役"), ("recorded-retired-scheme", "已退役"),
+    ("artifact", "injected artifact rejection"),
+])
+def test_rejected_submission_persists_failure_and_allows_new_version(projects_client, monkeypatch, failure, reason):  # noqa: F811
+    client, root, engine = projects_client
+    project = create_cleanup_project(client)
+    project_id = UUID(project["id"])
+    url = f'/api/v1/projects/{project["id"]}/versions'
+    response = client.post(url, json={})
+    assert response.status_code == 201, response.text
+    version_id = UUID(response.json()["id"])
+    directory = root / "runs" / str(version_id)
+    directory.mkdir(parents=True)
+    (directory / "factor.whl").write_bytes(b"unused wheel")
+    (directory / "uv.lock").write_text('[[package]]\nname="scheme"\nversion="1.2.0"\n', encoding="utf-8")
+    (directory / "build.json").write_text('{"scheme_version":"1.2.0"}', encoding="utf-8")
+    data = {"kind": "factor", "factor": {"package": project["packageName"], "version": "1.2.1",
+            "wheel": "factor.whl", "params": {}}, "environment": {"lockfile": "uv.lock"}, "analysis": {}}
+    if failure == "kind":
+        data["kind"] = "model"
+    elif failure == "package-version":
+        data["factor"]["version"] = "1.2.2"
+    elif failure == "missing-wheel":
+        (directory / "factor.whl").unlink()
+    elif failure == "missing-lock":
+        (directory / "uv.lock").unlink()
+    elif failure == "actual-scheme":
+        (directory / "build.json").write_text('{"scheme_version":"1.2.7"}', encoding="utf-8")
+    elif failure == "result-series":
+        (directory / "uv.lock").write_text('[[package]]\nname="scheme"\nversion="1.3.0"\n', encoding="utf-8")
+    elif failure == "retired-scheme":
+        (directory / "uv.lock").write_text('[[package]]\nname="scheme"\nversion="1.1.7"\n', encoding="utf-8")
+    elif failure == "recorded-retired-scheme":
+        with Session(engine) as session:
+            session.get(ProjectVersion, version_id).scheme_version = "1.1.7"
+            session.commit()
+    elif failure == "artifact":
+        def reject(*args, **kwargs):
+            raise ValueError("injected artifact rejection")
+        monkeypatch.setattr(versions.policy, "capture_task_artifacts", reject)
+    if failure != "missing-input":
+        (directory / "input.json").write_text("null" if failure == "invalid-input" else json.dumps(data), encoding="utf-8")
+    scheduler = MagicMock()
+    monkeypatch.setattr(versions, "DolphinSchedulerClient", scheduler)
+    response = client.post(f"{url}/{version_id}/submit", json={})
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    recorded_reason = detail["reason"] if isinstance(detail, dict) else detail
+    with Session(engine) as session:
+        version = session.get(ProjectVersion, version_id)
+        assert version.status == "failed"
+        assert version.error == recorded_reason and reason in version.error
+        assert version.finished_at is not None
+        assert session.get(Project, project_id).archived is False
+    assert client.post(f"{url}/{version_id}/submit", json={}).json()["phase"] == "failed"
+    saved = client.post(url, json={})
+    assert saved.status_code == 201, saved.text
+    assert saved.json()["packageVersion"] == "1.2.2" and saved.json()["phase"] == "building"
+    assert saved.json()["id"] != str(version_id)
+    scheduler.assert_not_called()
 
 
 @pytest.mark.parametrize("status", ["failed", "success"])
@@ -226,6 +320,100 @@ def test_login_failure_retries_existing_artifacts(submission):
     assert client.start.call_count == 1
 
 
+@pytest.mark.parametrize("retired_source", [None, "scheme-tag", "scheme-commit", "template-tag", "template-commit"])
+def test_retry_rechecks_accepted_upstream_without_recapture(projects_client, monkeypatch, retired_source):  # noqa: F811
+    client, root, engine = projects_client
+    with Session(engine, expire_on_commit=False) as session:
+        producer = make_project(session, root, kind="factor")
+        producer.scheme_version, producer.scheme_commit = "upstream-scheme", "d" * 40
+        producer.template_tag, producer.template_commit = "upstream-template", "c" * 40
+        session.commit()
+        wheel = make_wheel(root / "local" / "upstream.whl", producer.package_name)
+        upstream = register_file(session, wheel, producer, scheme_version="1.2.0")
+        consumer = make_project(session, root)
+        consumer.artifact_dependencies = {upstream.package_name: artifact_snapshot(upstream)}
+        session.commit()
+        original_sources = versions.policy.project_sources(consumer)
+        original_dependencies = deepcopy(consumer.artifact_dependencies)
+        version, directory, _ = make_run(session, root, consumer,
+            assets={upstream.package_name: wheel}, accepted=False)
+        version.status, version.finished_at = "building", None
+        session.commit()
+        project_id, version_id, upstream_name = consumer.id, version.id, upstream.package_name
+    (directory / "build.json").write_text('{"scheme_version":"1.2.0"}', encoding="utf-8")
+    factory = MagicMock()
+    scheduler = factory.return_value.__enter__.return_value
+    scheduler.start.side_effect = DolphinSchedulerError("temporary scheduler failure")
+    monkeypatch.setattr(versions, "DolphinSchedulerClient", factory)
+    # SQLite omits timezone offsets; keep this regression focused on admission/state.
+    monkeypatch.setattr(versions, "read_version", lambda record: {"phase": record.status})
+    endpoint = f"/api/v1/projects/{project_id}/versions/{version_id}/submit"
+    first = client.post(endpoint, json={})
+    assert first.status_code == 200 and first.json()["phase"] == "submit_failed"
+    scheduler.start.assert_called_once_with("model", str(directory / "input.json"))
+    with Session(engine) as session:
+        saved = session.get(ProjectVersion, version_id)
+        accepted = deepcopy(saved.accepted_artifacts)
+        assert upstream_name in accepted and saved.finished_at is not None
+    if retired_source:
+        kind, identity = retired_source.split("-")
+        source = accepted[upstream_name]["sources"][kind]
+        retired_policy = deepcopy(versions.policy.load_policy())
+        retired_policy["retired_releases"][kind].append({
+            "tag": source["tag"] if identity == "tag" else "unrelated-release",
+            "commit": source["commit"] if identity == "commit" else "e" * 40,
+            "reason": "upstream artifact source retired",
+        })
+        monkeypatch.setattr(versions.policy, "load_policy", lambda: retired_policy)
+    assert client.post(f"/api/v1/version-policy/projects/{project_id}/check").json() == {"allowed": True}
+
+    def no_capture(*args, **kwargs):
+        pytest.fail("Retry must reuse the accepted artifact snapshots")
+
+    monkeypatch.setattr(versions.policy, "capture_task_artifacts", no_capture)
+    factory.reset_mock()
+    scheduler.start.side_effect = None
+    response = client.post(endpoint, json={})
+    expected_status = "failed" if retired_source else "queued"
+    if retired_source:
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"] == {
+            "code": "version_retired", "reason": "upstream artifact source retired",
+        }
+        factory.assert_not_called()
+        scheduler.start.assert_not_called()
+    else:
+        assert response.status_code == 200 and response.json()["phase"] == "queued"
+        scheduler.start.assert_called_once_with("model", str(directory / "input.json"))
+    with Session(engine) as session:
+        saved = session.get(ProjectVersion, version_id)
+        assert saved.status == expected_status and saved.accepted_artifacts == accepted
+        assert saved.error == ("upstream artifact source retired" if retired_source else "")
+        assert (saved.finished_at is not None) == bool(retired_source)
+        project = session.get(Project, project_id)
+        assert versions.policy.project_sources(project) == original_sources
+        assert project.artifact_dependencies == original_dependencies
+    if retired_source:
+        assert client.post(endpoint, json={}).json() == {"phase": "failed"}
+        factory.assert_not_called()
+
+
+def test_submission_checks_newly_captured_artifact_series(submission, monkeypatch):
+    version, session, factory, _, _ = submission
+    captured = {"model-abcd": {"package": "model-abcd", "version": "1.3.1", "kind": "model",
+        "scheme_version": "1.3.0", "sources": versions.policy.project_sources(session.get.return_value)}}
+    capture = MagicMock(return_value=captured)
+    monkeypatch.setattr(versions.policy, "capture_task_artifacts", capture)
+    with pytest.raises(HTTPException) as error:
+        submit(version, session)
+    assert error.value.status_code == 422 and "候选成果必须使用实际 Scheme 的主、次版本" in str(error.value.detail)
+    assert version.accepted_artifacts is captured and version.status == "failed"
+    assert version.error == error.value.detail and version.finished_at is not None
+    capture.assert_called_once()
+    factory.assert_not_called()
+    session.commit.assert_called_once()
+
+
 def test_explicit_rejection_can_retry(submission):
     version, session, _, client, _ = submission
     client.start.side_effect = DolphinSchedulerError("workflow offline")
@@ -264,6 +452,7 @@ def test_reconcile_finds_instance_beyond_first_page(submission):
 def test_algo_submission_and_reconciliation_use_own_workflow(submission, kind):
     version, session, _, client, directory = submission
     session.get.return_value.kind = kind
+    session.get.return_value.package_name = f"{kind}-{version.project_id.hex[:4]}"
     path = directory / "input.json"
     data = json.loads(path.read_text())
     component = data.pop("factor")
@@ -272,7 +461,6 @@ def test_algo_submission_and_reconciliation_use_own_workflow(submission, kind):
     with ZipFile(component["wheel"], "w") as archive:
         archive.writestr(f"{package}.dist-info/METADATA", f"Name: {package}\nVersion: 1.2.1\nRequires-Dist: scheme>=1.2.0,<1.3.0\n")
         archive.writestr(package.replace("-", "_") + "/__init__.py", "")
-    component["sha256"] = hashlib.sha256(Path(component["wheel"]).read_bytes()).hexdigest()
     (directory / "uv.lock").write_text(f'[[package]]\nname="scheme"\nversion="1.2.0"\n[[package]]\nname="{package}"\nversion="1.2.1"\nsource={{path="factor.whl"}}\n')
     data.update(kind=kind, algos={kind: component},
                 backtest={"optimize": "risk_parity", "control": "no_control",
@@ -285,6 +473,76 @@ def test_algo_submission_and_reconciliation_use_own_workflow(submission, kind):
     assert kind not in version.parameters["algos"]
     submit(version, session)
     client.instances.assert_called_with(kind, page=1)
+
+
+@pytest.mark.parametrize("status", ["queued", "running"])
+@pytest.mark.parametrize("workflow_id", [None, 42])
+@pytest.mark.parametrize("filename,content", [
+    ("input.json", None), ("input.json", "{broken"), ("input.json", "null"),
+    ("uv.lock", None), ("uv.lock", "[[package]"),
+])
+def test_refresh_marks_missing_or_invalid_task_files_failed(submission, status, workflow_id, filename, content):
+    version, _, factory, _, directory = submission
+    version.status, version.workflow_id = status, workflow_id
+    path = directory / filename
+    if content is None:
+        path.unlink()
+    else:
+        path.write_text(content, encoding="utf-8")
+    versions.refresh_version(version, workflow_kind="factor")
+    assert version.status == "failed"
+    assert version.error.startswith("任务文件无效：") and len(version.error) > len("任务文件无效：")
+    assert version.finished_at is not None
+    factory.assert_not_called()
+
+
+@pytest.mark.parametrize("content", [None, "{broken", "null", '{"status":"success"}',
+                                      '{"status":"failed","versions":{"scheme":"1.2.0"}}'])
+def test_refresh_marks_missing_or_invalid_success_report_failed(submission, content):
+    version, _, _, client, directory = submission
+    version.status, version.workflow_id = "running", 42
+    report = directory / "report"
+    report.mkdir()
+    if content is not None:
+        (report / "run.json").write_text(content, encoding="utf-8")
+    client.instance.return_value = {"state": "SUCCESS"}
+    versions.refresh_version(version, workflow_kind="factor")
+    assert version.status == "failed"
+    assert version.error.startswith("报告清单无效：")
+    assert version.finished_at is not None
+    client.instance.assert_called_once_with(42)
+
+
+def test_refresh_accepts_success_report_without_hash_fields(submission):
+    version, _, _, client, directory = submission
+    version.status, version.workflow_id, version.scheme_version = "running", 42, "1.2.0"
+    report = directory / "report"
+    report.mkdir()
+    (report / "run.json").write_text(json.dumps({
+        "protocol": 1, "status": "success", "reports": {}, "versions": {"scheme": "1.2.0"},
+    }), encoding="utf-8")
+    client.instance.return_value = {"state": "SUCCESS"}
+    versions.refresh_version(version, workflow_kind="factor")
+    assert version.status == "success" and version.error == ""
+    assert version.scheme_version == "1.2.0" and version.finished_at is not None
+
+
+@pytest.mark.parametrize("status,workflow_id", [("queued", None), ("running", 42)])
+def test_refresh_preserves_original_state_only_for_scheduler_unavailable(submission, status, workflow_id):
+    version, _, factory, _, _ = submission
+    version.status, version.workflow_id, version.error = status, workflow_id, "submission pending"
+    factory.return_value.__enter__.side_effect = DolphinSchedulerError("temporarily unavailable")
+    versions.refresh_version(version, workflow_kind="factor")
+    assert version.status == status and version.workflow_id == workflow_id
+    assert version.error == "submission pending" and version.finished_at is None
+
+
+def test_refresh_does_not_hide_non_scheduler_errors(submission):
+    version, _, _, client, _ = submission
+    version.status, version.workflow_id = "running", 42
+    client.instance.side_effect = ValueError("invalid scheduler payload")
+    with pytest.raises(ValueError, match="invalid scheduler payload"):
+        versions.refresh_version(version, workflow_kind="factor")
 
 
 def test_reject_task_for_wrong_project_kind(submission):

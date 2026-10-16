@@ -156,20 +156,15 @@ def validate_template(project: dict, scheme: Version) -> None:
         raise ValueError("模板与 scheme 必须使用正式版本（主、次版本一致，patch 任意）")
     if (version.major, version.minor) != (scheme.major, scheme.minor):
         raise ValueError("模板主、次版本必须与 scheme 一致")
-    requirements = [(text, Requirement(text)) for text in project.get("dependencies", [])]
-    scheme_requirements = [(text, r) for text, r in requirements if r.name.lower() == "scheme"]
+    requirements = [Requirement(text) for text in project.get("dependencies", [])]
+    scheme_requirements = [requirement for requirement in requirements if requirement.name.lower() == "scheme"]
     minimum = Version(f"{scheme.major}.{scheme.minor}.0")
     maximum = Version(f"{scheme.major}.{scheme.minor + 1}.0")
-    message = f"模板必须声明同一 scheme 主、次版本的唯一完整 patch 范围：>={minimum},<{maximum}（无 URL、marker、extras）"
+    message = f"模板必须声明唯一 scheme 依赖，范围包含 {minimum} 且不包含 {maximum}"
     if len(scheme_requirements) != 1:
         raise ValueError(message)
-    text, requirement = scheme_requirements[0]
-    bounds = {specifier.operator: specifier.version for specifier in requirement.specifier}
-    # SpecifierSet 会去重；原始声明也只能包含两个边界。
-    if (requirement.url or requirement.marker or requirement.extras or text.count(",") != 1
-            or len(requirement.specifier) != 2 or set(bounds) != {">=", "<"}
-            or not all(re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,2}", value) for value in bounds.values())
-            or Version(bounds[">="]) != minimum or Version(bounds["<"]) != maximum):
+    requirement = scheme_requirements[0]
+    if minimum not in requirement.specifier or maximum in requirement.specifier:
         raise ValueError(message)
     if scheme not in requirement.specifier:
         raise ValueError(f"所选 scheme {scheme} 不满足模板依赖：{requirement}")

@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import socket
 import sys
 from threading import Event
@@ -256,3 +258,25 @@ def test_sync_creates_entities_only_once_after_readiness(monkeypatch):
     assert list(result) == ["factor", "model", "optimize", "control", "execution", "strategy"]
     assert list(result.values()) == list(range(1, 7))
     assert workflow.call_count == shell.call_count == workflow.return_value.submit.call_count == 6
+
+
+@pytest.mark.parametrize("enabled,failure", [(False, False), (True, False), (True, True)])
+def test_backend_startup_continues_after_logged_workflow_sync_failure(monkeypatch, caplog, enabled, failure):
+    import main
+
+    engine = Mock()
+    sync = Mock(side_effect=RuntimeError("gateway unavailable") if failure else None, return_value={"factor": 1})
+    monkeypatch.setattr(Settings, "ENABLED", enabled)
+    monkeypatch.setattr(main, "database_engine", lambda: engine)
+    monkeypatch.setattr(workflows, "sync_workflows", sync)
+
+    async def run():
+        async with main.lifespan(main.app):
+            assert not hasattr(main.app.state, "workflows")
+            engine.dispose.assert_not_called()
+
+    with caplog.at_level(logging.ERROR, logger="main"):
+        asyncio.run(run())
+    assert sync.call_count == int(enabled)
+    engine.dispose.assert_called_once_with()
+    assert ("工作流同步失败，后端继续启动" in caplog.text) == failure

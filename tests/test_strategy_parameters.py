@@ -251,7 +251,7 @@ def test_downstream_schema_hides_shared_inputs_and_selectors(selected_form):
     assert set(result["schema"]["properties"]) == {"window"}
     assert result["schema"]["required"] == []
     assert result["values"] == {"window": 20}
-    with pytest.raises(ValueError, match="未声明字段.*start"):
+    with pytest.raises(ValidationError):
         inspect({**data, "values": {"start": "2026-06-01"}})
 
 
@@ -280,8 +280,7 @@ def test_legacy_frozen_form_alias_round_trips_defaults_saved_and_submit(selected
         "backtest": {"window": 17}, "params": {"window": 17},
         **({"common": {}} if kind == "model" else {}),
     }
-    with pytest.raises(ValueError, match="未声明字段.*window"):
-        inspect({**data, "values": {"window": 17}})
+    assert inspect({**data, "values": {"window": 17}})["params"] == {"window": 17}
     with pytest.raises(ValidationError, match="lookback_days"):
         inspect({**data, "values": {"lookback_days": 0}})
 
@@ -343,10 +342,9 @@ def test_standalone_script_round_trips_frozen_form_with_only_legacy_scheme_api()
         "backtest": {"window": 17, "study": "not a runtime field"},
         "params": {"window": 17}, "common": {},
     }
-    rejected = execute({**data, "values": {"window": 17}})
-    assert rejected.returncode == 1
-    assert "window" in rejected.stderr
-    assert not rejected.stdout
+    ignored = execute({**data, "values": {"window": 17}})
+    assert ignored.returncode == 0
+    assert json.loads(ignored.stdout)["params"] == {"window": 20}
 
 
 @pytest.mark.parametrize("alias", [
@@ -371,9 +369,8 @@ def test_form_uses_published_validation_alias_not_serialization_alias(selected_f
     assert definition["schema"]["required"] == ["lookback_days"]
     assert definition["values"] == {"lookback_days": 17}
     assert inspect({**data, "values": definition["values"]})["params"] == {"window": 17}
-    for unknown in ("window", "serialized_days", "legacy_days", "config", "other"):
-        with pytest.raises(ValueError, match=f"未声明字段.*{unknown}"):
-            inspect({**data, "values": {"lookback_days": 17, unknown: 99}})
+    assert inspect({**data, "values": {"window": 17}})["params"] == {"window": 17}
+    assert inspect({**data, "values": {"lookback_days": 17, "other": 99}})["params"] == {"window": 17}
 
 
 def test_alias_classification_and_injected_common_selectors_use_canonical_names(selected_form):
@@ -402,7 +399,7 @@ def test_alias_classification_and_injected_common_selectors_use_canonical_names(
     assert set(definition["schema"]["properties"]) == {"start"}
     assert definition["values"] == {"start": 20}
     for hidden in ("start_on", "end_on", "initial_cash", "selected_model"):
-        with pytest.raises(ValueError, match=f"未声明字段.*{hidden}"):
+        with pytest.raises(ValidationError):
             inspect({**data, "values": {hidden: "not a visible parameter"}})
     result = inspect({
         **data, "values": {"start": 17},
@@ -491,8 +488,7 @@ def test_form_with_alias_validation_disabled_publishes_canonical_key(selected_fo
     assert set(definition["schema"]["properties"]) == {"window"}
     assert definition["values"] == {"window": 17}
     assert inspect({**data, "values": definition["values"]})["params"] == {"window": 17}
-    with pytest.raises(ValueError, match="未声明字段.*lookback_days"):
-        inspect({**data, "values": {"lookback_days": 17}})
+    assert inspect({**data, "values": {"lookback_days": 17}})["params"] == {"window": 20}
 
 
 def test_builtin_alias_parameters_use_the_same_published_wire_key(monkeypatch):
@@ -511,8 +507,7 @@ def test_builtin_alias_parameters_use_the_same_published_wire_key(monkeypatch):
     assert inspect({"kind": "optimize", "values": definition["values"]}) == {
         "params": {"window": 17},
     }
-    with pytest.raises(ValueError, match="未声明字段.*window"):
-        inspect({"kind": "optimize", "values": {"window": 17}})
+    assert inspect({"kind": "optimize", "values": {"window": 17}}) == {"params": {"window": 20}}
 
 
 def test_builtin_default_parameters_keep_legacy_discovery(monkeypatch):
@@ -641,7 +636,8 @@ def test_model_common_snapshot_uses_only_validated_declared_canonical_fields(sel
     assert result["params"] == {"window": 20}
     assert built[0].model_extra == {"unrelated": "must not leak"}
     assert "window" in result["backtest"] and "saved_days" not in result["backtest"]
-    with pytest.raises(ValueError, match=f"未声明字段.*{extra}"):
-        inspect({**data, "values": {**values, extra: "must not leak"}})
+    accepted = inspect({**data, "values": {**values, extra: "must not leak"}})
+    assert accepted["common"] == result["common"]
+    assert accepted["params"] == result["params"]
     with pytest.raises(ValidationError, match="initial_cash"):
         inspect({**data, "values": {**values, "initial_cash": 0}})

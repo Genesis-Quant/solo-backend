@@ -1,9 +1,8 @@
 """True deletion safety using temporary files, SQLite, and API-shaped resource fakes."""
 
-import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -16,8 +15,8 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from config import DolphinSchedulerSettings, SoloSettings
-from core.apps.artifacts.models import ArtifactInstallation, ResearchArtifact
+from config import DolphinSchedulerSettings
+from core.apps.artifacts.models import ResearchArtifact
 from core.apps.artifacts.service import artifact_snapshot
 from core.apps.projects import deletion, views
 from core.apps.projects.environment import EnvironmentError, kernel_directory
@@ -25,7 +24,8 @@ from core.apps.projects.models import Project, ProjectDeletion, ProjectVersion
 from core.apps.projects.schemas import ProjectEdit
 from core.apps.strategies.models import Strategy
 from core.scheduler.client import DolphinSchedulerClient, DolphinSchedulerError, instance_input_file
-from test_projects import create_cleanup_project, projects_client
+from test_projects import create_cleanup_project
+from test_projects import projects_client as projects_client
 
 
 class JupyterResources:
@@ -156,20 +156,20 @@ def test_retained_folder_option_only_retains_workspace(projects_client, resource
     assert create_cleanup_project(client, name=project["name"])["id"] != project["id"]
 
 
-def artifact(engine, root, project, *, published, digest_seed=b"wheel"):
+def artifact(engine, root, project, *, published, content=b"wheel"):
     contents = BytesIO()
     module = project["packageName"].replace("-", "_")
     with ZipFile(contents, "w") as wheel:
         wheel.writestr(f"{module}-1.2.1.dist-info/METADATA", f"Name: {project['packageName']}\nVersion: 1.2.1\n")
-        wheel.writestr(f"{module}/__init__.py", digest_seed)
-    digest_seed = contents.getvalue()
-    digest = hashlib.sha256(digest_seed).hexdigest()
+        wheel.writestr(f"{module}/__init__.py", content)
+    content = contents.getvalue()
+    identifier = uuid4()
     filename = module + "-1.2.1-py3-none-any.whl"
-    directory = root / "artifacts" / digest
+    directory = root / "artifacts" / str(identifier)
     directory.mkdir(parents=True)
-    (directory / filename).write_bytes(digest_seed)
-    record = ResearchArtifact(id=uuid4(), kind=project["kind"], package_name=project["packageName"],
-        version="1.2.1", sha256=digest, filename=filename, size_bytes=len(digest_seed), entry=module + ":Algo",
+    (directory / filename).write_bytes(content)
+    record = ResearchArtifact(id=identifier, kind=project["kind"], package_name=project["packageName"],
+        version="1.2.1", storage_directory=str(identifier), filename=filename, size_bytes=len(content), entry=module + ":Algo",
         scheme_version="1.2.0", sources={}, origin_project_id=UUID(project["id"]), origin_project_name=project["name"],
         published_at=datetime.now(UTC) if published else None, dependencies={})
     with Session(engine, expire_on_commit=False) as session:
@@ -183,8 +183,8 @@ def test_published_and_accepted_artifacts_survive_unreferenced_candidates_gc(pro
     project = create_cleanup_project(client)
     consumer = create_cleanup_project(client, name="consumer", kind="model")
     published, published_wheel = artifact(engine, root, project, published=True)
-    accepted, accepted_wheel = artifact(engine, root, project, published=False, digest_seed=b"accepted-wheel")
-    orphan, orphan_wheel = artifact(engine, root, project, published=False, digest_seed=b"orphan-wheel")
+    accepted, accepted_wheel = artifact(engine, root, project, published=False, content=b"accepted-wheel")
+    orphan, orphan_wheel = artifact(engine, root, project, published=False, content=b"orphan-wheel")
     published_bytes, accepted_bytes = published_wheel.read_bytes(), accepted_wheel.read_bytes()
     with Session(engine) as session:
         saved_consumer = session.get(Project, UUID(consumer["id"]))
@@ -598,7 +598,7 @@ def test_deletion_guard_prevents_same_uuid_reentrant_cleanup(projects_client, re
     client, root, engine = projects_client
     project = create_cleanup_project(client)
     with Session(engine) as session:
-        with deletion.deletion_guard(UUID(project["id"]), session):
+        with deletion.project_lifecycle_guard(UUID(project["id"]), session):
             assert client.delete(f"/api/v1/projects/{project['id']}").status_code == 409
     assert resources.calls == [] and (root / project["directory"]).exists()
 
@@ -778,7 +778,7 @@ def test_busy_lifecycle_rejects_patch_before_checks(projects_client, resources, 
     monkeypatch.setattr(views, "require_not_deleting", check)
     monkeypatch.setattr(views, "get_project_or_404", check)
     with Session(engine) as deleting:
-        with deletion.deletion_guard(UUID(project["id"]), deleting):
+        with deletion.project_lifecycle_guard(UUID(project["id"]), deleting):
             response = client.patch(f"/api/v1/projects/{project['id']}", json={"name": name})
             assert response.status_code == 409, response.text
     check.assert_not_called()
@@ -814,7 +814,7 @@ def test_postgresql_lifecycle_guard_excludes_other_workers_across_commits_and_ro
         with monkeypatch.context() as worker:
             worker.setattr(deletion, "_lifecycle_projects", set())  # Independent worker's process set.
             with pytest.raises(views.HTTPException) as conflict:
-                with deletion.deletion_guard(identifier, contender):
+                with deletion.project_lifecycle_guard(identifier, contender):
                     pytest.fail("another worker acquired the held project lifecycle lock")
             assert conflict.value.status_code == 409
             assert not deletion._lifecycle_projects
@@ -829,41 +829,6 @@ def test_postgresql_lifecycle_guard_excludes_other_workers_across_commits_and_ro
     assert owned.execute.call_args.args[1] == {"key": key}
     owned.close.assert_called_once()
     assert identifier not in deletion._lifecycle_projects
-
-
-@pytest.mark.parametrize("expired", [False, True])
-def test_rename_preserves_unresolved_accepted_installation_recovery(projects_client, resources, expired):
-    client, root, engine = projects_client
-    project = create_cleanup_project(client)
-    identifier, install_id = UUID(project["id"]), uuid4()
-    workspace = root / project["directory"]
-    marker = workspace / ".solo-installation.json"
-    marker.write_text(json.dumps({"install_id": str(install_id), "recovery": "accepted"}))
-    before = {path.relative_to(workspace): path.read_bytes() for path in workspace.rglob("*") if path.is_file()}
-    kernel = kernel_directory(project["id"]) / "kernel.json"
-    old_kernel = kernel.read_bytes()
-    receipt = {"format": 1, "before": {}, "pending": {}, "accepted": {}}
-    with Session(engine) as session:
-        session.add(ArtifactInstallation(id=install_id, consumer_project_id=identifier, artifacts=receipt,
-            expires_at=datetime.now(UTC) + timedelta(days=-1 if expired else 1)))
-        session.commit()
-    url = f"/api/v1/projects/{identifier}"
-    response = client.patch(url, json={"name": "renamed"})
-    assert response.status_code == 409 and response.json()["detail"]["code"] == "artifact_conflict"
-    assert {path.relative_to(workspace): path.read_bytes() for path in workspace.rglob("*") if path.is_file()} == before
-    assert kernel.read_bytes() == old_kernel
-    assert not workspace.with_name("renamed").exists() and not list(workspace.parent.glob(".rename-*"))
-    assert resources.calls == []
-    response = client.patch(url, json={"name": project["name"], "description": "description only"})
-    assert response.status_code == 200 and response.json()["description"] == "description only"
-    with Session(engine) as session:
-        assert session.get(ArtifactInstallation, install_id).artifacts == receipt
-        session.delete(session.get(ArtifactInstallation, install_id))
-        session.commit()
-    marker.unlink()  # Simulate completed recovery before retrying rename.
-    assert client.patch(url, json={"name": "renamed"}).status_code == 200
-    assert client.delete(url).status_code == 204
-    assert not workspace.with_name("renamed").exists() and not kernel.parent.exists()
 
 
 @pytest.mark.parametrize("failure", ["acquire", "unlock", "close"])
@@ -886,3 +851,73 @@ def test_lifecycle_guard_releases_process_exclusion_on_connection_failure(failur
     local.get_bind.return_value.dialect.name = "sqlite"
     with deletion.project_lifecycle_guard(identifier, local):
         pass
+
+
+def test_read_metadata_preserves_large_custom_fields(tmp_path):
+    path = tmp_path / ".solo"
+    metadata = {"project_id": str(uuid4()), "custom": "x" * 70000}
+    path.write_text(json.dumps(metadata), encoding="utf-8")
+    assert deletion.read_metadata(path) == metadata
+
+
+@pytest.mark.parametrize("target", ["boundary", "outside"])
+def test_checked_directory_rejects_resolved_boundary_and_escape(tmp_path, target):
+    boundary = tmp_path / "shared"
+    boundary.mkdir()
+    directory = boundary if target == "boundary" else tmp_path / "outside"
+    with pytest.raises(views.HTTPException) as error:
+        deletion.checked_directory(directory, boundary)
+    assert error.value.status_code == 409
+
+
+@pytest.mark.parametrize("target", ["inside", "boundary", "outside"])
+def test_checked_directory_uses_resolved_link_target_without_creation_privileges(tmp_path, monkeypatch, target):
+    boundary = tmp_path / "shared"
+    alias = boundary / "alias"
+    alias.mkdir(parents=True)
+    resolved = {"inside": boundary / "real", "boundary": boundary, "outside": tmp_path / "outside"}[target]
+    original = Path.resolve
+    monkeypatch.setattr(Path, "resolve", lambda path, **kwargs: resolved if path == alias else original(path, **kwargs))
+    if target == "inside":
+        assert deletion.checked_directory(alias, boundary)
+    else:
+        with pytest.raises(views.HTTPException) as error:
+            deletion.checked_directory(alias, boundary)
+        assert error.value.status_code == 409
+
+
+def test_checked_directory_accepts_in_boundary_link_and_rejects_link_to_boundary(tmp_path):
+    child = tmp_path / "real"
+    child.mkdir()
+    link, root_link = tmp_path / "alias", tmp_path / "root-alias"
+    try:
+        link.symlink_to(child, target_is_directory=True)
+        root_link.symlink_to(tmp_path, target_is_directory=True)
+    except OSError:
+        pytest.skip("系统不允许创建符号链接")
+    assert deletion.checked_directory(link, tmp_path)
+    with pytest.raises(views.HTTPException):
+        deletion.checked_directory(root_link, tmp_path)
+
+
+@pytest.mark.parametrize("location", ["project", "kind"])
+def test_delete_accepts_directory_links_within_boundary_without_deleting_link_target(
+        projects_client, resources, location):
+    client, root, _ = projects_client
+    project = create_cleanup_project(client)
+    directory = root / project["directory"]
+    source = directory if location == "project" else directory.parent
+    target = root / f"aliased-{location}"
+    source.rename(target)
+    try:
+        source.symlink_to(target, target_is_directory=True)
+    except OSError:
+        target.rename(source)
+        pytest.skip("系统不允许创建符号链接")
+    response = client.delete(f'/api/v1/projects/{project["id"]}')
+    assert response.status_code == 204, response.text
+    if location == "project":
+        assert not source.is_symlink() and (target / "research.ipynb").is_file()
+    else:
+        assert source.is_symlink() and target.is_dir()
+        assert not (target / project["name"]).exists()

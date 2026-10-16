@@ -4,10 +4,11 @@ from typing import Annotated, Literal, TypeAlias
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from core.apps import version_policy as policy
+from core.apps.projects import deletion
 from core.apps.projects.models import Project, ProjectDeletion, ProjectVersion
 from core.apps.strategies.models import Strategy
 from core.database.session import get_database_session
@@ -17,10 +18,7 @@ Database: TypeAlias = Annotated[Session, Depends(get_database_session)]
 
 
 class TaskCheck(BaseModel):
-    model_config = ConfigDict(extra="forbid")
     kind: Literal["factor", "model", "optimize", "control", "execution", "strategy"]
-    input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    lock_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 @router.get("")
@@ -30,6 +28,8 @@ def get_policy() -> dict:
 
 @router.post("/projects/{project_id}/check")
 def check_project(project_id: UUID, session: Database) -> dict:
+    if deletion.project_lifecycle_busy(project_id):
+        raise HTTPException(409, {"code": "project_busy", "reason": "项目正在升级、修改或删除，请稍后重试"})
     project = session.get(Project, project_id)
     if project is None:
         raise HTTPException(404, "项目不存在")
@@ -46,23 +46,19 @@ def check_project(project_id: UUID, session: Database) -> dict:
 
 @router.post("/tasks/{run_id}/check")
 def check_task(run_id: UUID, body: TaskCheck, session: Database) -> dict:
-    version = session.get(ProjectVersion, run_id)
-    strategy = session.get(Strategy, run_id)
-    if (version is None) == (strategy is None):
-        raise HTTPException(422, {"code": "task_not_found", "reason": "Run 必须对应唯一数据库任务记录"})
-    record = version if version is not None else strategy
-    project = session.get(Project, version.project_id) if version is not None else None
-    if version is not None and project is None:
-        raise HTTPException(422, {"code": "task_not_found", "reason": "任务所属项目不存在"})
-    if body.kind != (project.kind if project is not None else "strategy"):
-        raise HTTPException(422, {"code": "task_identity_mismatch", "reason": "任务 kind 与数据库记录不一致"})
+    record = session.get(Strategy if body.kind == "strategy" else ProjectVersion, run_id)
+    if record is None:
+        other = session.get(ProjectVersion if body.kind == "strategy" else Strategy, run_id)
+        if other is not None:
+            raise HTTPException(422, {"code": "task_identity_mismatch", "reason": "任务 kind 与数据库记录不一致"})
+        raise HTTPException(404, {"code": "task_not_found", "reason": "任务不存在"})
+    project = session.get(Project, record.project_id) if body.kind != "strategy" else None
+    if body.kind != "strategy" and project is None:
+        raise HTTPException(404, {"code": "task_not_found", "reason": "任务所属项目不存在"})
     try:
-        grandfathered = policy.check_task(session, record, project=project, kind=body.kind,
-                                          input_sha256=body.input_sha256, lock_sha256=body.lock_sha256,
-                                          require_accepted=True)
+        policy.check_task(session, record, project=project, kind=body.kind)
     except policy.VersionPolicyError as error:
         raise HTTPException(422, error.detail) from error
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (ValueError, KeyError, TypeError) as error:
         raise HTTPException(422, {"code": "task_identity_mismatch", "reason": str(error)}) from error
-    return {"allowed": True, "grandfathered": grandfathered,
-            "artifacts": policy.accepted_runtime_artifacts(record, policy.run_path(run_id), body.kind)}
+    return {"allowed": True}

@@ -1,4 +1,3 @@
-import hashlib
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 from uuid import UUID
@@ -21,7 +20,7 @@ from core.apps.projects.views import Database
 from core.scheduler.client import DolphinSchedulerClient, DolphinSchedulerError
 
 from .models import Strategy
-from .service import KINDS, build, inspect_component, require_components, selected
+from .service import ComponentInspector, KINDS, build, selected
 
 router = APIRouter(prefix="/api/v1/strategies", tags=["strategies"])
 
@@ -74,7 +73,8 @@ def list_strategies(session: Database) -> list[dict]:
 def forms(body: Selection, session: Database) -> dict:
     try:
         components = selected(session, body.model_dump())
-        return {kind: inspect_component(components, kind) for kind in KINDS}
+        inspector = ComponentInspector(components)
+        return {kind: inspector.inspect(kind) for kind in KINDS}
     except policy.VersionPolicyError as error:
         raise HTTPException(422, error.detail) from error
     except (ValueError, OSError, KeyError, TypeError) as error:
@@ -88,14 +88,13 @@ def create_strategy(body: CreateStrategy, session: Database) -> dict:
     try:
         lock_registry(session)
         components = selected(session, body.selections.model_dump())
-        require_components(components)
         descriptors = {}
         for kind, item in components.items():
             descriptor = {key: value for key, value in item.items()
                           if key not in {"component", "input", "environment_path"}}
             if item.get("component"):
                 descriptor["component_snapshot"] = {key: item["component"][key]
-                                                    for key in ("package", "version", "entry", "sha256")}
+                                                    for key in ("package", "version", "entry")}
             descriptors[kind] = descriptor
         strategy = Strategy(name=body.name.strip(), forms=body.forms, components=descriptors)
         session.add(strategy)
@@ -106,10 +105,6 @@ def create_strategy(body: CreateStrategy, session: Database) -> dict:
             strategy.accepted_artifacts = policy.capture_task_artifacts(
                 session, strategy, kind="strategy", directory=directory,
             )
-            policy.check_task(session, strategy, kind="strategy", directory=directory)
-            _, lockfile, _ = policy.task_files(directory, "strategy")
-            strategy.input_sha256 = hashlib.sha256((directory / "input.json").read_bytes()).hexdigest()
-            strategy.lock_sha256 = hashlib.sha256(lockfile.read_bytes()).hexdigest()
             strategy.status = "queued"
             session.commit()
             with DolphinSchedulerClient() as client:

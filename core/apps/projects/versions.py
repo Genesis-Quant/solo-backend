@@ -1,5 +1,4 @@
 """项目保存记录及正式任务提交；不在 Backend 执行研究代码。"""
-import hashlib
 import json
 import re
 import tomllib
@@ -48,11 +47,20 @@ def refresh_version(version: ProjectVersion, *, workflow_kind: str | None = None
         return
     directory = version_directory(version)
     try:
+        data, _, lock = policy.task_files(directory, workflow_kind or json.loads(
+            (directory / "input.json").read_text(encoding="utf-8"))["kind"])
+        actual, _ = policy.locked_scheme(lock)
+        if version.scheme_version and policy.formal_version(version.scheme_version) != actual:
+            raise ValueError("任务 ActualScheme 与冻结环境不一致")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        version.status, version.error = "failed", f"任务文件无效：{error}"
+        version.finished_at = datetime.now(UTC)
+        return
+    try:
         with DolphinSchedulerClient() as client:
             if not version.workflow_id:
                 page = 1
                 while True:
-                    data = json.loads((directory / "input.json").read_text())
                     instances = client.instances(workflow_kind or data["kind"], page=page)
                     for instance in instances:
                         params = json.loads(instance.get("globalParams") or "[]")
@@ -65,25 +73,17 @@ def refresh_version(version: ProjectVersion, *, workflow_kind: str | None = None
             if not version.workflow_id:
                 return
             instance = client.instance(version.workflow_id)
-    except (DolphinSchedulerError, OSError, ValueError, KeyError):
-        return  # 调度服务短暂不可用时保留原状态。
+    except DolphinSchedulerError:
+        return  # 调度服务暂时不可用不改变本地任务状态。
     state = instance["state"]
     version.error = ""
     if state == "SUCCESS":
         try:
-            run = json.loads((directory / "report/run.json").read_text())
-            if run["status"] != "success" or run["input_sha256"] != hashlib.sha256((directory / "input.json").read_bytes()).hexdigest():
-                raise ValueError("报告与提交输入不一致")
-            data = json.loads((directory / "input.json").read_text(encoding="utf-8"))
-            _, lockfile, lock = policy.task_files(directory, workflow_kind or data["kind"])
-            actual, _ = policy.locked_scheme(lock)
-            if (policy.formal_version(run["versions"]["scheme"]) != actual
-                    or run["lock_sha256"] != hashlib.sha256(lockfile.read_bytes()).hexdigest()
-                    or (version.scheme_version and policy.formal_version(version.scheme_version) != actual)):
-                raise ValueError("报告 ActualScheme 或锁文件与任务冻结环境不一致")
-            version.scheme_version = str(actual)
-            version.status = "success"
-        except (OSError, KeyError, ValueError) as error:
+            run = json.loads((directory / "report/run.json").read_text(encoding="utf-8"))
+            if run["status"] != "success" or policy.formal_version(run["versions"]["scheme"]) != actual:
+                raise ValueError("报告 ActualScheme 或状态与任务不一致")
+            version.scheme_version, version.status = str(actual), "success"
+        except (OSError, KeyError, ValueError, TypeError) as error:
             version.status, version.error = "failed", f"报告清单无效：{error}"
     elif state in {"FAILURE", "STOP", "KILL", "PAUSE"}:
         version.status, version.error = "failed", f"DolphinScheduler：{state}，请查看任务日志"
@@ -203,17 +203,8 @@ def submit_version(project_id: UUID, version_id: UUID, body: BuildResult, sessio
         )
         if reason:
             raise policy.VersionPolicyError(reason)
-    except policy.VersionPolicyError as error:
-        raise HTTPException(422, error.detail) from error
-    directory = version_directory(version)
-    try:
-        project = get_project_or_404(session, project_id)
+        directory = version_directory(version)
         kind = project.kind
-        if not version.accepted_artifacts:
-            version.accepted_artifacts = policy.capture_task_artifacts(
-                session, version, project=project, directory=directory, kind=kind,
-            )
-        policy.check_task(session, version, project=project, directory=directory, kind=kind)
         data = json.loads((directory / "input.json").read_text())
         if data["kind"] != kind:
             raise ValueError("研究类型与项目不一致")
@@ -236,20 +227,28 @@ def submit_version(project_id: UUID, version_id: UUID, body: BuildResult, sessio
         version.parameters["dependencies"] = research_dependencies(
             directory / data["environment"]["lockfile"], component["package"],
         )
-        _, lockfile, frozen = policy.task_files(directory, kind)
-        actual, _ = policy.locked_scheme(frozen)
+        _, _, frozen = policy.task_files(directory, kind)
+        actual = policy.require_locked_scheme(frozen)
+        policy.require_result_series(version.package_version, actual)
         built = json.loads((directory / "build.json").read_text())["scheme_version"]
         if policy.formal_version(built) != actual:
             raise ValueError("build.json ActualScheme 与冻结锁文件不一致")
         version.scheme_version = str(actual)
-    except policy.VersionPolicyError as error:
-        raise HTTPException(422, error.detail) from error
+        if not version.accepted_artifacts:
+            version.accepted_artifacts = policy.capture_task_artifacts(
+                session, version, project=project, directory=directory, kind=kind,
+            )
+        policy.require_accepted_artifacts(version.accepted_artifacts, actual)
     except (OSError, ValueError, KeyError, TypeError) as error:
-        raise HTTPException(422, f"构建产物不完整：{error}") from error
+        if isinstance(error, policy.VersionPolicyError):
+            detail, reason = error.detail, error.reason
+        else:
+            detail = reason = f"构建产物不完整：{error}"
+        version.status, version.error = "failed", reason
+        version.finished_at = datetime.now(UTC)
+        session.commit()
+        raise HTTPException(422, detail) from error
     # 先持久化提交意图；遇到网络超时仍按 input_file 查询实例，不盲目重试。
-    version.input_sha256 = hashlib.sha256((directory / "input.json").read_bytes()).hexdigest()
-    _, lockfile, _ = policy.task_files(directory, project.kind)
-    version.lock_sha256 = hashlib.sha256(lockfile.read_bytes()).hexdigest()
     version.status = "queued"
     version.error = ""
     version.finished_at = None

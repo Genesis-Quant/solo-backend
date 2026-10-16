@@ -1,7 +1,15 @@
-from unittest.mock import Mock
+import json
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock, Mock
+from uuid import uuid4
 
 import pytest
 import requests
+from fastapi import HTTPException
+
+from config import SoloSettings
+from core.scheduler import __main__ as cli
 from core.scheduler.client import (
     DolphinSchedulerClient,
     DolphinSchedulerError,
@@ -23,6 +31,70 @@ from core.scheduler.client import (
 def test_reject_unsafe_input(path):
     with pytest.raises(ValueError):
         validate_input_file(path)
+
+
+@pytest.mark.parametrize("kind", ["factor", "model", "optimize", "control", "execution", "strategy"])
+def test_cli_start_checks_database_with_only_kind_before_scheduler(tmp_path, monkeypatch, capsys, kind):
+    monkeypatch.setattr(SoloSettings, "SHARED_DIR", tmp_path)
+    identifier = uuid4()
+    input_file = tmp_path / "runs" / str(identifier) / "input.json"
+    monkeypatch.setattr(sys, "argv", ["scheduler", "start", kind, "--input-file", str(input_file)])
+    database = MagicMock()
+    session = database.return_value.__enter__.return_value
+    monkeypatch.setattr(cli, "database_session_factory", lambda: database)
+    scheduler = MagicMock()
+    scheduler.return_value.__enter__.return_value.start.return_value = {"accepted": True}
+    events = []
+    def check(run_id, body, current):
+        assert run_id == identifier and current is session
+        assert body.model_dump() == {"kind": kind}
+        events.append("admitted")
+        scheduler.assert_not_called()
+        return {"allowed": True}
+    def login():
+        assert events == ["admitted"]
+        events.append("scheduler")
+        return scheduler.return_value.__enter__.return_value
+    def no_task_reads(*args, **kwargs):
+        pytest.fail("CLI admission must not read input or lock files")
+    monkeypatch.setattr(cli, "check_task", check)
+    monkeypatch.setattr(cli, "DolphinSchedulerClient", scheduler)
+    scheduler.return_value.__enter__.side_effect = login
+    monkeypatch.setattr(Path, "read_text", no_task_reads)
+    monkeypatch.setattr(Path, "read_bytes", no_task_reads)
+    cli.main()
+    assert events == ["admitted", "scheduler"]
+    scheduler.return_value.__enter__.return_value.start.assert_called_once_with(kind, str(input_file))
+    assert json.loads(capsys.readouterr().out) == {"accepted": True}
+    assert not input_file.exists()
+
+
+def test_cli_denied_task_never_logs_into_scheduler(tmp_path, monkeypatch):
+    monkeypatch.setattr(SoloSettings, "SHARED_DIR", tmp_path)
+    input_file = tmp_path / "runs" / str(uuid4()) / "input.json"
+    monkeypatch.setattr(sys, "argv", ["scheduler", "start", "model", "--input-file", str(input_file)])
+    monkeypatch.setattr(cli, "database_session_factory", lambda: MagicMock())
+    denial = HTTPException(422, {"code": "version_retired", "reason": "retired source"})
+    monkeypatch.setattr(cli, "check_task", Mock(side_effect=denial))
+    scheduler = Mock()
+    monkeypatch.setattr(cli, "DolphinSchedulerClient", scheduler)
+    with pytest.raises(HTTPException) as error:
+        cli.main()
+    assert error.value is denial
+    scheduler.assert_not_called()
+
+
+def test_cli_rejects_noncanonical_input_before_database_and_scheduler(tmp_path, monkeypatch):
+    monkeypatch.setattr(SoloSettings, "SHARED_DIR", tmp_path)
+    input_file = tmp_path / "other" / str(uuid4()) / "input.json"
+    monkeypatch.setattr(sys, "argv", ["scheduler", "start", "factor", "--input-file", str(input_file)])
+    database, scheduler = Mock(), Mock()
+    monkeypatch.setattr(cli, "database_session_factory", database)
+    monkeypatch.setattr(cli, "DolphinSchedulerClient", scheduler)
+    with pytest.raises(ValueError, match="runs/\\{id\\}/input.json"):
+        cli.main()
+    database.assert_not_called()
+    scheduler.assert_not_called()
 
 
 def test_reject_backtest_workflow_alias():

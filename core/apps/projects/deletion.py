@@ -26,9 +26,14 @@ _lifecycle_projects: set[UUID] = set()
 _lifecycle_lock = Lock()
 
 
+def project_lifecycle_busy(project_id: UUID) -> bool:
+    with _lifecycle_lock:
+        return project_id in _lifecycle_projects
+
+
 @contextmanager
 def project_lifecycle_guard(project_id: UUID, session: Session):
-    """Exclude PATCH and DELETE for the UUID until filesystem cleanup/rollback finishes."""
+    """Exclude project edits, upgrades and deletion through filesystem rollback."""
     with _lifecycle_lock:
         if project_id in _lifecycle_projects:
             raise HTTPException(409, "项目正在修改或删除，请稍后重试")
@@ -66,32 +71,15 @@ def project_lifecycle_guard(project_id: UUID, session: Session):
                 _lifecycle_projects.discard(project_id)
 
 
-# Compatibility for existing callers; there is only one lifecycle lock namespace.
-deletion_guard = project_lifecycle_guard
-
-
 def checked_directory(directory: Path, boundary: Path) -> bool:
-    if directory == boundary or not directory.is_relative_to(boundary):
-        raise HTTPException(409, "项目清理路径不安全，未删除任何文件")
-    current = directory
-    while True:
-        if current.is_symlink() or current.is_junction():
-            raise HTTPException(409, "项目清理路径包含链接，未删除任何文件")
-        if current == boundary:
-            break
-        current = current.parent
-    for current in (boundary, *boundary.parents):
-        if current.is_symlink() or current.is_junction():
-            raise HTTPException(409, "项目清理边界包含链接，未删除任何文件")
-    if not directory.resolve().is_relative_to(boundary.resolve()):
+    resolved, boundary = directory.resolve(), boundary.resolve()
+    if resolved == boundary or not resolved.is_relative_to(boundary):
         raise HTTPException(409, "项目清理路径越界，未删除任何文件")
-    if directory.exists() and not directory.is_dir():
-        raise HTTPException(409, "项目清理目标不是文件夹，未删除任何文件")
     return directory.is_dir()
 
 
 def read_metadata(path: Path) -> dict:
-    if path.is_symlink() or path.is_junction() or not path.is_file() or path.stat().st_size > 65536:
+    if path.is_symlink() or path.is_junction() or not path.is_file():
         raise HTTPException(409, "无法确认文件夹所属项目，未删除任何文件")
     try:
         metadata = json.loads(path.read_text(encoding="utf-8"))
@@ -330,7 +318,10 @@ def purge_staged(paths: list[dict], expected: dict) -> None:
         for item in paths:
             staged = Path(item["staged"])
             if staged.parent == container and checked_directory(staged, boundary):
-                shutil.rmtree(staged)
+                if staged.is_symlink():
+                    staged.unlink()
+                else:
+                    shutil.rmtree(staged)
         # The outer ownership marker outlives partial rmtree, enabling safe retries.
         (container / "metadata.json").unlink(missing_ok=True)
         container.rmdir()
@@ -416,7 +407,7 @@ def _delete_project(project_id: UUID, session: Session, *, delete_files: bool) -
                     instances = client.owned_instances(project.kind, inputs, known)
                 job.payload = {**job.payload, "instances": instances}
                 session.flush()
-            elif known or any(version.input_sha256 for version in versions):
+            elif known:
                 raise HTTPException(503, "DolphinScheduler 不可用，无法确认任务清理，请稍后重试")
             stop_jupyter(project.id, f"projects/{project.kind}/{project.name}")
             validate_sources(project, paths)

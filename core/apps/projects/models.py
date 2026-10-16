@@ -15,9 +15,6 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Uuid,
-    event,
-    inspect,
-    select,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -73,30 +70,12 @@ class ProjectVersion(Base):
     note: Mapped[str] = mapped_column(String(500), default="", comment="版本备注")
     status: Mapped[str] = mapped_column(String(32), default="building", comment="building/queued/running/success/failed/submit_failed")
     workflow_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="DolphinScheduler 实例 ID")
-    input_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="提交前接受的准确输入哈希")
-    lock_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="提交前接受的准确锁文件哈希")
     accepted_artifacts: Mapped[dict | None] = mapped_column(JSON, default=dict, nullable=True, comment="任务接受时冻结的 package 到 artifact 快照；旧记录允许 NULL")
     parameters: Mapped[dict] = mapped_column(JSON, default=dict, comment="冻结的输入参数")
     scheme_version: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="任务实际 Scheme 版本")
     error: Mapped[str] = mapped_column(Text, default="", comment="构建或运行错误")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-
-
-def immutable_accepted_artifacts(mapper, connection, record) -> None:
-    """A legacy NULL/empty manifest can be captured once; accepted truth cannot change."""
-    if not inspect(record).attrs.accepted_artifacts.history.has_changes():
-        return
-    table = mapper.local_table
-    previous = connection.execute(select(table.c.accepted_artifacts, table.c.input_sha256,
-        table.c.lock_sha256).where(table.c.id == record.id)).one()
-    if previous.accepted_artifacts and previous.input_sha256 and previous.lock_sha256:
-        raise ValueError("Task accepted artifact snapshots are immutable after exact hash acceptance")
-
-
-@event.listens_for(ProjectVersion, "before_update")
-def immutable_project_version_artifacts(mapper, connection, record) -> None:
-    immutable_accepted_artifacts(mapper, connection, record)
 
 
 class ProjectDeletion(Base):

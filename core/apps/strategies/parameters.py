@@ -173,9 +173,6 @@ def inspect(data: dict) -> dict:
             if wire[name] in values:
                 values[wire[name]] = _form_value(values[wire[name]], form.model_fields[name].annotation)
         return {"schema": schema, "values": values}
-    unknown = set(data["values"]) - published
-    if unknown:
-        raise ValueError(f"{kind} Form 包含未声明字段：{sorted(unknown)}")
     if data.get("entry"):
         values = {
             wire[name]: value for name, value in data.get("common", {}).items()

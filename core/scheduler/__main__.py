@@ -1,7 +1,6 @@
 """python -m core.scheduler sync/start/instances/tasks/log。"""
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 from uuid import UUID
@@ -39,12 +38,8 @@ def main() -> None:
             if input_file != (policy.run_path(run_id) / "input.json").resolve():
                 raise ValueError("CLI 只能提交对应数据库 runs/{id}/input.json")
             # CLI has no REST admission layer; check before even logging into DS.
-            _, lockfile, _ = policy.task_files(input_file.parent, args.kind)
             with database_session_factory()() as session:
-                check_task(run_id, TaskCheck(
-                    kind=args.kind, input_sha256=hashlib.sha256(input_file.read_bytes()).hexdigest(),
-                    lock_sha256=hashlib.sha256(lockfile.read_bytes()).hexdigest(),
-                ), session)
+                check_task(run_id, TaskCheck(kind=args.kind), session)
         with DolphinSchedulerClient() as client:
             if args.command == "start":
                 result = client.start(args.kind, args.input_file)

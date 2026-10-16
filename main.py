@@ -1,5 +1,6 @@
 """FastAPI entry point."""
 
+import logging
 from asyncio import to_thread
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -23,7 +24,10 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     if DolphinSchedulerSettings.ENABLED:
         from core.scheduler.workflows import sync_workflows
 
-        application.state.workflows = await to_thread(sync_workflows)
+        try:
+            await to_thread(sync_workflows)
+        except Exception:
+            logging.getLogger(__name__).exception("DolphinScheduler 工作流同步失败，后端继续启动")
     try:
         yield
     finally:

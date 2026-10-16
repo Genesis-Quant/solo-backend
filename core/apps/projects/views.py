@@ -26,6 +26,7 @@ from .schemas import (
     ProjectEdit,
     ProjectKind,
     ProjectRead,
+    ProjectUpgrade,
     TemplateVersion,
 )
 
@@ -38,13 +39,20 @@ def project_directory(project: Project) -> Path:
 
 
 def write_project_metadata(project: Project, directory: Path) -> None:
-    (directory / ".solo").write_text(json.dumps({
+    path = directory / ".solo"
+    metadata = {}
+    if path.exists() or path.is_symlink() or path.is_junction():
+        from .deletion import read_metadata
+
+        metadata = read_metadata(path)
+    metadata.update({
         "project_id": str(project.id), "name": project.name, "kind": project.kind,
         "scheme_version": project.scheme_version, "scheme_commit": project.scheme_commit,
         "algo_version": project.template_tag, "algo_commit": project.template_commit,
         "template_package_version": project.template_package_version,
         "package_name": project.package_name,
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    })
+    path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def read_project(project: Project) -> ProjectRead:
@@ -190,6 +198,13 @@ def create_project(body: ProjectCreate, session: Database) -> ProjectRead:
         raise HTTPException(503, "无法创建项目目录，请检查共享目录权限") from error
 
 
+@router.post("/projects/{project_id}/upgrade", response_model=ProjectRead)
+def upgrade_project(project_id: UUID, body: ProjectUpgrade, session: Database) -> ProjectRead:
+    from .upgrade import upgrade_project as upgrade
+
+    return read_project(upgrade(project_id, body, session))
+
+
 @router.patch("/projects/{project_id}", response_model=ProjectRead)
 def edit_project(project_id: UUID, body: ProjectEdit, session: Database) -> ProjectRead:
     # Acquire before journal/project reads, and retain through rollback and backup cleanup.
@@ -208,19 +223,10 @@ def _edit_project(project_id: UUID, body: ProjectEdit, session: Session) -> Proj
         project.description = body.description
         session.commit()
         return read_project(project)
-    from core.apps.artifacts.service import ArtifactError, require_settled_installations
-
-    try:
-        # Do not invalidate an accepted install's exact workspace recovery bytes/paths.
-        require_settled_installations(session, project_id)
-    except ArtifactError as error:
-        raise HTTPException(409, error.detail) from error
     source = project_directory(project)
     try:
-        original_lock = (source / "uv.lock").read_bytes()
-        original_scheme = policy.require_project(project, lock=tomllib.loads(original_lock.decode("utf-8")))
-        original_pyproject = (source / "pyproject.toml").read_bytes()
-        scheme_source = tomllib.loads(original_pyproject.decode("utf-8")).get("tool", {}).get("uv", {}).get("sources", {}).get("scheme", {})
+        policy.require_project(project)
+        scheme_source = tomllib.loads((source / "pyproject.toml").read_text(encoding="utf-8")).get("tool", {}).get("uv", {}).get("sources", {}).get("scheme", {})
         retired = policy.retired_release("scheme", tag=scheme_source.get("tag"), commit=scheme_source.get("rev"))
         if retired:
             raise policy.VersionPolicyError(retired["reason"])
@@ -236,8 +242,7 @@ def _edit_project(project_id: UUID, body: ProjectEdit, session: Session) -> Proj
     # 虚拟环境含绝对路径；重命名时重建环境，并保留原环境供失败回滚。
     kernel_file = kernel_directory(str(project.id)) / "kernel.json"
     old_kernel = kernel_file.read_bytes()
-    original_files = {"pyproject.toml": original_pyproject, "uv.lock": original_lock,
-                      ".solo": (source / ".solo").read_bytes(),
+    original_files = {".solo": (source / ".solo").read_bytes(),
                       "research.ipynb": (source / "research.ipynb").read_bytes()}
     backup = Path(tempfile.mkdtemp(prefix=".rename-", dir=source.parent))
     try:
@@ -246,14 +251,6 @@ def _edit_project(project_id: UUID, body: ProjectEdit, session: Session) -> Proj
         project.name, project.description = body.name, body.description
         write_project_metadata(project, destination)
         prepare_environment(destination, str(project.id), project.name, locked=True)
-        # Admission is repeated after installation, before any database commit.
-        # --locked validates edited TOML against the original lock; it must never
-        # resolve a newer/retired Scheme or replace any accepted package source.
-        if policy.require_project(project) != original_scheme:
-            raise ValueError("重命名不能改变实际 Scheme")
-        if ((destination / "uv.lock").read_bytes() != original_lock
-                or (destination / "pyproject.toml").read_bytes() != original_pyproject):
-            raise ValueError("重命名不能改变冻结锁文件或依赖来源")
         session.commit()
     except Exception as error:
         session.rollback()

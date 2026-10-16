@@ -1,6 +1,5 @@
 """Model wire input crosses the real service/inspector boundary without research."""
 
-import hashlib
 import json
 import sys
 from datetime import date, timedelta
@@ -102,7 +101,6 @@ def handoff(tmp_path, monkeypatch):
             "component": {
                 "entry": f"{module.__name__}:{algo.__name__}",
                 "package": module.__name__, "version": "1.2.1", "wheel": str(wheel),
-                "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
             },
         }
 
@@ -120,7 +118,7 @@ def handoff(tmp_path, monkeypatch):
         return json.dumps(parameters.inspect(data))
 
     monkeypatch.setattr(service, "require_components", lambda _: None)
-    monkeypatch.setattr(service, "scheme_source", lambda _: ("1.2.0", {"path": str(tmp_path / "scheme.whl")}))
+    monkeypatch.setattr(service, "scheme_source", lambda _: ("1.2.0", [{"path": str(tmp_path / "scheme.whl")}]))
     (tmp_path / "scheme.whl").write_bytes(b"local frozen SDK")
     monkeypatch.setattr(service, "command", command)
     return components, builds, payloads

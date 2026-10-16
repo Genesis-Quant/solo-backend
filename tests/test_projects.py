@@ -1,4 +1,3 @@
-import hashlib
 import json
 import re
 import subprocess
@@ -412,7 +411,7 @@ def test_delete_files_does_not_block_frozen_active_consumer(projects_client, idl
             assert session.scalar(select(Strategy)).status == "building"
 
 
-@pytest.mark.parametrize("location", ["project", "kind", "marker", "kernel"])
+@pytest.mark.parametrize("location", ["marker", "kernel"])
 def test_delete_files_rejects_symlink_paths(projects_client, idle_jupyter, location):
     client, root, _ = projects_client
     project = create_cleanup_project(client)
@@ -420,15 +419,9 @@ def test_delete_files_rejects_symlink_paths(projects_client, idle_jupyter, locat
     if location == "marker":
         original = directory / ".solo"
         target = root / "outside-marker.json"
-    elif location == "kernel":
+    else:
         original = kernel_directory(project["id"])
         target = root / "outside-kernel"
-    elif location == "kind":
-        original = directory.parent
-        target = root / "outside-kind"
-    else:
-        original = directory
-        target = root / "outside-project"
     original.rename(target)
     try:
         original.symlink_to(target, target_is_directory=location != "marker")
@@ -593,78 +586,42 @@ SCHEME_COMPATIBILITY = [
     pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.0", "1.1.0", True, id="minimum"),
     pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.7", "1.1.0", True, id="newer-scheme-patch"),
     pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.0", "1.1.7", True, id="older-scheme-patch"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.7", "1.1.7", True, id="matching-patch"),
     pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.999", "1.1.3", True, id="independent-patches"),
-    pytest.param(["scheme>=1.0.0,<1.1.0"], "1.0.7", "1.0.0", True, id="another-minor"),
-    pytest.param(["scheme>=1.0.0,<1.1.0"], "1.1.0", "1.0.0", False, id="old-on-new"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.0.0", "1.1.0", False, id="new-on-old"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.0.7", "1.1.0", False, id="new-on-old-patch"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.2.0", "1.1.0", False, id="later-minor"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.0", "1.0.7", False, id="earlier-template-minor"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.0", "1.2.0", False, id="later-template-minor"),
-    pytest.param(["scheme>=1.1.5,<1.2.0"], "1.1.0", "1.1.0", False, id="below-patch-minimum"),
-    pytest.param(["scheme>=1.1.5,<1.2.0"], "1.1.7", "1.1.7", False, id="restricted-patch-minimum"),
-    pytest.param(["pydantic>=2,<3", "ScHeMe (<1.2.0, >=1.1.0)"], "1.1.7", "1.1.0", True, id="order-case-and-other-dependency"),
+    pytest.param(["pydantic>=2,<3", "ScHeMe (<1.2.0, >=1.1.0)"], "1.1.7", "1.1.0", True, id="order-case"),
     pytest.param(["scheme>=0.1.0,<0.2.0"], "0.1.7", "0.1.0", True, id="zero-major"),
     pytest.param(["scheme>=2.1.0,<2.2.0"], "2.1.0", "2.1.7", True, id="another-major"),
+    pytest.param(["scheme>=1.1,<1.2"], "1.1", "1.1.7", True, id="shorthand"),
+    pytest.param(['scheme>=1.1.0,<1.2.0; python_version >= "3.12"'], "1.1.0", "1.1.0", True, id="marker"),
+    pytest.param(["scheme[extra]>=1.1.0,<1.2.0"], "1.1.0", "1.1.0", True, id="extras"),
+    pytest.param(["scheme~=1.1.0"], "1.1.7", "1.1.0", True, id="compatible-operator"),
+    pytest.param(["scheme==1.1.*"], "1.1.7", "1.1.0", True, id="wildcard"),
+    pytest.param(["scheme>=1.1.0,<1.2.0,!=1.1.5"], "1.1.7", "1.1.0", True, id="excluded-other-patch"),
+    pytest.param(["scheme>=1.0.0,>=1.1.0,<1.2.0,<1.3.0"], "1.1.0", "1.1.0", True, id="redundant-bounds"),
+    pytest.param(["scheme>=1.1.0,>=1.1.0,<1.2.0,<1.2.0"], "1.1.0", "1.1.0", True, id="duplicate-bounds"),
+    pytest.param(["scheme>=1.0.0,<1.2.0"], "1.1.0", "1.1.0", True, id="broader-lower"),
+    pytest.param(["scheme==1.1.0"], "1.1.0", "1.1.0", True, id="exact-satisfies-boundary-contract"),
+    pytest.param(["scheme>=1.1.0,<1.1.9"], "1.1.7", "1.1.0", True, id="narrower-upper"),
+    pytest.param(["scheme>=1.1.0rc1,<1.2.0"], "1.1.0", "1.1.0", True, id="prerelease-boundary"),
+    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.0.7", "1.1.0", False, id="scheme-minor-mismatch"),
+    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.0", "1.2.0", False, id="template-minor-mismatch"),
     pytest.param(["scheme>=1.1.0,<1.2.0"], "2.0.0", "1.1.0", False, id="scheme-major-mismatch"),
     pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.0", "2.0.0", False, id="template-major-mismatch"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.0", "invalid", False, id="invalid-template-version"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1", "1.1", True, id="actual-shorthand"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.7rc1", "1.1.0", False, id="actual-prerelease"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.7.dev1", "1.1.0", False, id="actual-dev"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.7.post1", "1.1.0", False, id="actual-post"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.7+local", "1.1.0", False, id="actual-local"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1!1.1.7", "1.1.0", False, id="actual-epoch"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.7.0", "1.1.0", False, id="actual-four-part"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.0", "1.1.7rc1", False, id="template-prerelease"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.0", "1.1.7.dev1", False, id="template-dev"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.0", "1.1.7.post1", False, id="template-post"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.0", "1.1.7+local", False, id="template-local"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.0", "1!1.1.7", False, id="template-epoch"),
-    pytest.param(["scheme>=1.1.0,<1.2.0"], "1.1.0", "1.1.7.0", False, id="template-four-part"),
+    pytest.param(["scheme>=1.1.5,<1.2.0"], "1.1.7", "1.1.7", False, id="excludes-series-minimum"),
     pytest.param([], "1.1.0", "1.1.0", False, id="missing"),
     pytest.param(["scheme>=1.1.0,<1.2.0", "Scheme>=1.1.0,<1.2.0"], "1.1.0", "1.1.0", False, id="multiple"),
-    pytest.param(["scheme @ https://example.invalid/scheme.whl"], "1.1.0", "1.1.0", False, id="url"),
-    pytest.param(["scheme @ git+https://example.invalid/scheme.git@deadbeef"], "1.1.0", "1.1.0", False, id="git-url"),
-    pytest.param(['scheme>=1.1.0,<1.2.0; python_version >= "3.12"'], "1.1.0", "1.1.0", False, id="marker"),
-    pytest.param(["scheme[extra]>=1.1.0,<1.2.0"], "1.1.0", "1.1.0", False, id="extras"),
-    pytest.param(["scheme==1.1.0"], "1.1.0", "1.1.0", False, id="exact"),
-    pytest.param(["scheme==1.1.*"], "1.1.0", "1.1.0", False, id="wildcard"),
-    pytest.param(["scheme>=1.1.0"], "1.1.0", "1.1.0", False, id="missing-upper"),
-    pytest.param(["scheme<1.2.0"], "1.1.0", "1.1.0", False, id="missing-lower"),
-    pytest.param(["scheme>=1.2.0,<1.2.0"], "1.1.0", "1.1.0", False, id="cross-major-lower"),
-    pytest.param(["scheme>=1.1.0,<3.0.0"], "1.1.0", "1.1.0", False, id="cross-major-upper"),
-    pytest.param(["scheme>=1.1.0,<2.0.0"], "1.1.0", "1.1.0", False, id="legacy-major-range"),
-    pytest.param(["scheme>=1.0.0,<1.2.0"], "1.1.0", "1.1.0", False, id="cross-minor-lower"),
-    pytest.param(["scheme>=1.1.0,<1.3.0"], "1.1.0", "1.1.0", False, id="cross-minor-upper"),
-    pytest.param(["scheme>=1.1.0,<1.1.9"], "1.1.0", "1.1.0", False, id="narrow-upper"),
-    pytest.param(["scheme>=1.1.0,<1.2.7"], "1.1.0", "1.1.0", False, id="nonzero-upper-patch"),
+    pytest.param(["scheme @ https://example.invalid/scheme.whl"], "1.1.0", "1.1.0", False, id="url-without-range"),
+    pytest.param(["scheme>=1.1.0"], "1.1.0", "1.1.0", False, id="includes-next-minor"),
     pytest.param(["scheme>=1.1.0,<=1.2.0"], "1.1.0", "1.1.0", False, id="inclusive-upper"),
     pytest.param(["scheme>1.1.0,<1.2.0"], "1.1.7", "1.1.0", False, id="exclusive-lower"),
-    pytest.param(["scheme>=1.1.0,<1.2.0,!=1.1.5"], "1.1.0", "1.1.0", False, id="excluded-version"),
-    pytest.param(["scheme~=1.1.0,<1.2.0"], "1.1.0", "1.1.0", False, id="compatible-operator"),
-    pytest.param(["scheme~=1.1.0"], "1.1.0", "1.1.0", False, id="compatible-only"),
-    pytest.param(["scheme>=1.0.0,>=1.1.0,<1.2.0"], "1.1.0", "1.1.0", False, id="multiple-lower"),
-    pytest.param(["scheme>=1.1.0,<1.2.0,<1.3.0"], "1.1.0", "1.1.0", False, id="multiple-upper"),
-    pytest.param(["scheme>=1.1.0,>=1.1.0,<1.2.0"], "1.1.0", "1.1.0", False, id="duplicate-lower"),
-    pytest.param(["scheme>=1.1.0,<1.2.0,<1.2.0"], "1.1.0", "1.1.0", False, id="duplicate-upper"),
-    pytest.param(["scheme>=1,<1.1"], "1.0.7", "1.0.0", True, id="zero-minor-shorthand"),
-    pytest.param(["scheme>=1.1,<1.2"], "1.1.0", "1.1.7", True, id="shorthand"),
-    pytest.param(["scheme>=1.1,<1.2"], "1.0.7", "1.1.0", False, id="shorthand-below-minimum"),
-    pytest.param(["scheme>=1.1,<1.2.0"], "1.1.0", "1.1.0", True, id="shorthand-lower"),
-    pytest.param(["scheme>=1.1.0,<1.2"], "1.1.7", "1.1.0", True, id="shorthand-upper"),
-    pytest.param(["scheme>=1.1,<2"], "1.1.0", "1.1.0", False, id="legacy-shorthand"),
-    pytest.param(["scheme>=1.1.0rc1,<1.2.0"], "1.1.0", "1.1.0", False, id="prerelease-lower"),
-    pytest.param(["scheme>=1.1.0.dev1,<1.2.0"], "1.1.0", "1.1.0", False, id="dev-lower"),
-    pytest.param(["scheme>=1.1.0.post1,<1.2.0"], "1.1.7", "1.1.0", False, id="post-lower"),
-    pytest.param(["scheme>=1.1.0+local,<1.2.0"], "1.1.0", "1.1.0", False, id="local-lower"),
-    pytest.param(["scheme>=1!1.1.0,<1.2.0"], "1.1.0", "1.1.0", False, id="epoch-lower"),
-    pytest.param(["scheme>=1.1.0.0,<1.2.0"], "1.1.0", "1.1.0", False, id="four-part-lower"),
-    pytest.param(["scheme>=1.1.0,<1.2.0rc1"], "1.1.0", "1.1.0", False, id="prerelease-upper"),
+    pytest.param(["scheme>=1.1.0,<1.2.0,!=1.1.5"], "1.1.5", "1.1.0", False, id="selected-excluded"),
     pytest.param(["scheme>=not-a-version,<1.2.0"], "1.1.0", "1.1.0", False, id="malformed"),
+    *[
+        pytest.param(["scheme>=1.1.0,<1.2.0"], value if side == "scheme" else "1.1.0",
+                     value if side == "template" else "1.1.0", False, id=f"{side}-{value}")
+        for side in ("scheme", "template")
+        for value in ("invalid", "1.1.7rc1", "1.1.7.dev1", "1.1.7.post1", "1.1.7+local", "1!1.1.7", "1.1.7.0")
+    ],
 ]
-
 
 @pytest.fixture
 def template_metadata(monkeypatch):
@@ -743,12 +700,79 @@ def test_template_selection_skips_invalid_release_and_keeps_compatible(monkeypat
     assert templates.list_versions("factor", selected.tag) == [releases[2].model_copy(update={"version": "1.2.7"})]
 
 
-def directory_digest(directory):
-    return {str(path.relative_to(directory)): hashlib.sha256(path.read_bytes()).hexdigest()
+def directory_files(directory):
+    return {str(path.relative_to(directory)): path.read_bytes()
             for path in directory.rglob("*") if path.is_file()}
 
 
-@pytest.mark.parametrize("failure", ["uv-conflict", "retired-postcheck", "changed-source"])
+def test_rename_uses_locked_sync_without_source_byte_checks(projects_client, monkeypatch):
+    client, root, _ = projects_client
+    project = create_cleanup_project(client, name="original")
+    calls = []
+    require_project = policy.require_project
+    prepare = views.prepare_environment
+    read_bytes, write_bytes = Path.read_bytes, Path.write_bytes
+
+    def require(record, **kwargs):
+        calls.append(record.name)
+        return require_project(record, **kwargs)
+
+    def rebuild(directory, project_id, name, *, locked=False):
+        assert locked is True
+        assert calls == ["original"]
+        prepare(directory, project_id, name, locked=locked)
+
+    def read(path):
+        assert path.name not in {"uv.lock", "pyproject.toml"}
+        return read_bytes(path)
+
+    def write(path, content):
+        assert path.name not in {"uv.lock", "pyproject.toml"}
+        return write_bytes(path, content)
+
+    monkeypatch.setattr(policy, "require_project", require)
+    monkeypatch.setattr(views, "prepare_environment", rebuild)
+    monkeypatch.setattr(Path, "read_bytes", read)
+    monkeypatch.setattr(Path, "write_bytes", write)
+    response = client.patch(f"/api/v1/projects/{project['id']}", json={"name": "renamed"})
+    assert response.status_code == 200, response.text
+    # The second read only computes the response's retirement state after commit.
+    assert calls == ["original", "renamed"]
+    assert response.json()["retired"] is False
+    assert not (root / project["directory"]).exists()
+    assert json.loads((root / "projects/factor/renamed/.solo").read_text())["name"] == "renamed"
+
+
+@pytest.mark.parametrize("source", ["project-release", "locked-scheme", "pyproject-source"])
+def test_rename_preserves_retirement_admission_before_moving(projects_client, monkeypatch, source):
+    client, root, engine = projects_client
+    project = create_cleanup_project(client, name="original")
+    directory = root / project["directory"]
+    retired = policy.load_policy()["retired_releases"]["scheme"][0]
+    if source == "project-release":
+        with Session(engine) as session:
+            session.get(Project, UUID(project["id"])).scheme_commit = retired["commit"]
+            session.commit()
+    elif source == "locked-scheme":
+        (directory / "uv.lock").write_text('[[package]]\nname="scheme"\nversion="1.1.7"\n')
+    else:
+        path = directory / "pyproject.toml"
+        path.write_text(path.read_text(encoding="utf-8").replace("b" * 40, retired["commit"]), encoding="utf-8")
+    before = directory_files(directory)
+
+    def rebuild(*args, **kwargs):
+        raise AssertionError("Retired projects must be rejected before rebuilding")
+
+    monkeypatch.setattr(views, "prepare_environment", rebuild)
+    response = client.patch(f"/api/v1/projects/{project['id']}", json={"name": "renamed"})
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "version_retired"
+    assert directory_files(directory) == before
+    assert not directory.with_name("renamed").exists()
+    assert not list(directory.parent.glob(".rename-*"))
+
+
+@pytest.mark.parametrize("failure", ["uv-conflict", "kernel-import", "notebook", "commit"])
 def test_rename_locked_environment_failure_restores_exact_source_tree(projects_client, monkeypatch, failure):
     from core.apps.projects import environment
 
@@ -758,55 +782,66 @@ def test_rename_locked_environment_failure_restores_exact_source_tree(projects_c
     }).json()
     source = root / "projects/model/original"
     (source / ".venv/installed.txt").write_bytes(b"original exact environment")
-    # The TOML was edited without re-locking. Renaming must validate this input
-    # with --locked, not resolve it and silently replace the active old lock.
+    # --locked rejects edited requirements without modifying TOML or the lock.
     path = source / "pyproject.toml"
     if failure == "uv-conflict":
         path.write_text(path.read_text(encoding="utf-8").replace(
             "scheme>=1.2.0,<1.3.0", "scheme>=1.1.0,<1.2.0"), encoding="utf-8")
-    before = directory_digest(source)
+    before = directory_files(source)
     kernel = kernel_directory(project["id"]) / "kernel.json"
     old_kernel = kernel.read_bytes()
-    old_lock = (source / "uv.lock").read_bytes()
     calls = []
+    read_bytes, write_bytes, write_text = Path.read_bytes, Path.write_bytes, Path.write_text
 
     def run(args, **kwargs):
         calls.append(args)
-        assert args[:2] == ["uv", "sync"]
-        assert "--locked" in args
-        renamed = Path(args[args.index("--project") + 1])
-        assert (renamed / "uv.lock").read_bytes() == old_lock
-        (renamed / ".venv").mkdir()
-        (renamed / ".venv/partial.txt").write_text("must be discarded")
-        if failure == "uv-conflict":
-            # Model even a faulty installer that writes before returning failure.
-            (renamed / "uv.lock").write_text('[[package]]\nname="scheme"\nversion="1.1.7"\n')
-            (renamed / "research.ipynb").write_text('{"metadata":{"changed":true}}')
-            kernel.write_text("changed")
-            return subprocess.CompletedProcess(args, 1, "", "lockfile needs to be updated, but --locked was provided")
-        if failure == "retired-postcheck":
-            (renamed / "uv.lock").write_text('[[package]]\nname="scheme"\nversion="1.1.7"\n')
+        if args[:2] == ["uv", "sync"]:
+            assert "--locked" in args
+            renamed = Path(args[args.index("--project") + 1])
+            assert json.loads((renamed / ".solo").read_text())["name"] == "renamed"
+            (renamed / ".venv").mkdir()
+            (renamed / ".venv/partial.txt").write_text("must be discarded")
+            if failure == "uv-conflict":
+                return subprocess.CompletedProcess(args, 1, "", "lockfile needs to be updated, but --locked was provided")
         else:
-            pyproject = renamed / "pyproject.toml"
-            pyproject.write_text(pyproject.read_text(encoding="utf-8").replace('b' * 40, 'c' * 40), encoding="utf-8")
+            assert args[1:] == ["-c", "import ipykernel"]
+            if failure == "kernel-import":
+                return subprocess.CompletedProcess(args, 1, "", "missing ipykernel")
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    def rebuild(directory, project_id, name, *, locked=False):
-        if failure == "uv-conflict":
-            return environment.prepare_environment(directory, project_id, name, locked=locked)
-        assert locked is True
-        run(["uv", "sync", "--project", str(directory), "--locked"])
-        kernel.write_text("changed")
-        (directory / "research.ipynb").write_text('{"metadata":{"changed":true}}')
+    def read(path):
+        assert path.name not in {"uv.lock", "pyproject.toml"}
+        return read_bytes(path)
+
+    def write(path, content):
+        assert path.name not in {"uv.lock", "pyproject.toml"}
+        return write_bytes(path, content)
+
+    def notebook_write(path, content, *args, **kwargs):
+        result = write_text(path, content, *args, **kwargs)
+        if path.name == "research.ipynb":
+            raise OSError("notebook write failed after changing content")
+        return result
+
+    def commit(session):
+        renamed = source.with_name("renamed")
+        assert json.loads((renamed / "research.ipynb").read_text())["metadata"]["kernelspec"]["display_name"] == "renamed"
+        assert json.loads(kernel.read_text())["display_name"] == "renamed"
+        raise RuntimeError("commit failed")
 
     monkeypatch.setattr(environment.subprocess, "run", run)
-    monkeypatch.setattr(views, "prepare_environment", rebuild)
-    response = client.patch(f"/api/v1/projects/{project['id']}", json={"name": "renamed", "description": "new"})
-    assert response.status_code == {"uv-conflict": 502, "retired-postcheck": 422, "changed-source": 503}[failure], response.text
-    if failure == "retired-postcheck":
-        assert response.json()["detail"]["code"] == "version_retired"
-    assert len(calls) == 1
-    assert directory_digest(source) == before
+    monkeypatch.setattr(views, "prepare_environment", environment.prepare_environment)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_bytes", read)
+        patch.setattr(Path, "write_bytes", write)
+        if failure == "notebook":
+            patch.setattr(Path, "write_text", notebook_write)
+        if failure == "commit":
+            patch.setattr(Session, "commit", commit)
+        response = client.patch(f"/api/v1/projects/{project['id']}", json={"name": "renamed", "description": "new"})
+    assert response.status_code == (502 if failure in {"uv-conflict", "kernel-import"} else 503), response.text
+    assert len(calls) == (1 if failure == "uv-conflict" else 2)
+    assert directory_files(source) == before
     assert kernel.read_bytes() == old_kernel
     assert not source.with_name("renamed").exists()
     assert not list(source.parent.glob(".rename-*"))
