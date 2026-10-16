@@ -74,6 +74,24 @@ def submit(version, session):
     return versions.submit_version(version.project_id, version.id, versions.BuildResult(), session)
 
 
+def test_factor_submission_keeps_closed_dates_only_in_analysis(submission):
+    version, session, _, client, directory = submission
+    path = directory / "input.json"
+    data = json.loads(path.read_text())
+    data["factor"]["params"] = {"universe": {"pool": "全市场"}, "window": 20}
+    data["analysis"] = {
+        "start": "2025-01-06", "end": "2025-01-06", "universe": {"pool": "全市场"},
+        "columns": ["score"], "max_lag": 1, "groups": 5, "n_select": 10, "weight": "equal",
+    }
+    path.write_text(json.dumps(data), encoding="utf-8")
+    result = submit(version, session)
+    assert result["phase"] == "queued"
+    assert version.parameters["factor"] == data["factor"]["params"]
+    assert version.parameters["analysis"] == data["analysis"]
+    assert "start" not in version.parameters["factor"] and "end" not in version.parameters["factor"]
+    client.start.assert_called_once_with("factor", str(path))
+
+
 @pytest.mark.parametrize("scheme_version,series", [("1.2.0", "1.2"), ("1.2.7", "1.2"), ("1.2.99", "1.2")])
 @pytest.mark.parametrize("previous_number", [0, 7])
 def test_create_version_uses_actual_locked_scheme_series(tmp_path, monkeypatch, scheme_version, series, previous_number):
