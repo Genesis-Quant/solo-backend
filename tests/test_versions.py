@@ -81,7 +81,8 @@ def test_factor_submission_keeps_closed_dates_only_in_analysis(submission):
     data["factor"]["params"] = {"universe": {"pool": "全市场"}, "window": 20}
     data["analysis"] = {
         "start": "2025-01-06", "end": "2025-01-06", "universe": {"pool": "全市场"},
-        "columns": ["score"], "max_lag": 1, "groups": 5, "n_select": 10, "weight": "equal",
+        "columns": ["score"], "period": 5, "price_column": "open_hfq", "max_lag": 3,
+        "groups": 5, "n_select": 10, "weight": "equal",
     }
     path.write_text(json.dumps(data), encoding="utf-8")
     result = submit(version, session)
