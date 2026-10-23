@@ -15,44 +15,71 @@ def kernel_directory(project_id: str) -> Path:
     return SoloSettings.SHARED_DIR / "kernels" / f"solo-{project_id}"
 
 
-def request_environment(directory: Path, project_id: str, name: str, *, locked: bool = False,
-                        mode: str = "prepare") -> None:
+def request_environment(
+    directory: Path,
+    project_id: str,
+    name: str,
+    *,
+    locked: bool = False,
+    mode: str = "prepare",
+) -> None:
     try:
-        path = directory.resolve().relative_to(SoloSettings.SHARED_DIR.resolve()).as_posix()
+        path = (
+            directory.resolve()
+            .relative_to(SoloSettings.SHARED_DIR.resolve())
+            .as_posix()
+        )
     except ValueError as error:
         raise EnvironmentError("项目环境路径不在共享目录内") from error
-    headers = {"Authorization": f"token {SoloSettings.JUPYTER_TOKEN}"} if SoloSettings.JUPYTER_TOKEN else {}
-
-    def redact(message: str) -> str:
-        for secret in (SoloSettings.GITEE_TOKEN, SoloSettings.JUPYTER_TOKEN):
-            if secret:
-                message = message.replace(secret, "[REDACTED]")
-        return message[-3000:]
+    headers = (
+        {"Authorization": f"token {SoloSettings.JUPYTER_TOKEN}"}
+        if SoloSettings.JUPYTER_TOKEN
+        else {}
+    )
 
     try:
         with requests.Session() as client:
             client.trust_env = False
             response = client.post(
                 SoloSettings.JUPYTER_API_URL + "/solo/project/environment",
-                headers=headers, json={"path": path, "project_id": project_id, "name": name,
-                                       "locked": locked, "mode": mode},
-                timeout=(3, 650), allow_redirects=False,
+                headers=headers,
+                json={
+                    "path": path,
+                    "project_id": project_id,
+                    "name": name,
+                    "locked": locked,
+                    "mode": mode,
+                },
+                timeout=(3, 650),
+                allow_redirects=False,
             )
         if response.status_code != 200:
             try:
                 body = response.json()
                 # Jupyter 把具体原因放在 reason，message 只是 HTTP 状态的通用短语。
-                message = body.get("reason") or body.get("message") or "Jupyter 环境服务请求失败"
+                message = (
+                    body.get("reason")
+                    or body.get("message")
+                    or "Jupyter 环境服务请求失败"
+                )
             except (ValueError, AttributeError):
                 message = "Jupyter 环境服务请求失败"
-            raise EnvironmentError(f"项目环境安装失败：\n{redact(str(message))}")
+            message = str(message)
+            for secret in (SoloSettings.GITEE_TOKEN, SoloSettings.JUPYTER_TOKEN):
+                if secret:
+                    message = message.replace(secret, "[REDACTED]")
+            raise EnvironmentError(f"项目环境安装失败：\n{message[-3000:]}")
     except requests.Timeout:
-        raise EnvironmentError("项目环境安装超时，请检查 Jupyter 服务和依赖下载网络后重试") from None
+        raise EnvironmentError(
+            "项目环境安装超时，请检查 Jupyter 服务和依赖下载网络后重试"
+        ) from None
     except requests.RequestException:
         raise EnvironmentError("无法连接 Jupyter 项目环境服务，请稍后重试") from None
 
 
-def prepare_environment(directory: Path, project_id: str, name: str, *, locked: bool = False) -> None:
+def prepare_environment(
+    directory: Path, project_id: str, name: str, *, locked: bool = False
+) -> None:
     request_environment(directory, project_id, name, locked=locked)
 
 
