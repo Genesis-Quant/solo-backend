@@ -60,8 +60,7 @@ class DolphinSchedulerSettings:
 
 
 class SoloSettings:
-    HOME_DIR = Path.home()
-    SHARED_DIR = Path(os.getenv("SOLO_SHARED_DIR", "/shared"))
+    SHARED_DIR = Path(os.getenv("SOLO_SHARED_DIR", "/data"))
     TEMPLATE_REPOSITORY = "genesis-quant/solo-algos"
     SCHEME_REPOSITORY = "genesis-quant/solo-algo-scheme"
     GITEE_TOKEN = os.getenv("GITEE_TOKEN", "")

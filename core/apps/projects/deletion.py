@@ -231,7 +231,8 @@ def resource_plan(project_id: UUID, name: str, kind: str, delete_files: bool, ru
     workspace = shared / "projects" / kind / name
     sources = ([("project", workspace, shared)] if delete_files else [])
     sources += [(value, shared / "runs" / value, shared) for value in run_ids]
-    sources.append(("kernel", kernel_directory(str(project_id)), SoloSettings.HOME_DIR))
+    kernel = kernel_directory(str(project_id))
+    sources.append(("kernel", kernel, kernel.parent))
     return [{"source": str(source), "staged": str(source.parent / f".delete-{project_id}" / label),
              "boundary": str(boundary)} for label, source, boundary in sources]
 
@@ -289,9 +290,22 @@ def validate_sources(project: Project, paths: list[dict]) -> None:
     for item in paths:
         source = Path(item["source"])
         if checked_directory(source, Path(item["boundary"])) and source == kernel_directory(str(project.id)):
-            argv = read_metadata(source / "kernel.json").get("argv")
-            if not isinstance(argv, list) or not argv or argv[0] != str(workspace / ".venv" / "bin" / "python"):
+            specification = read_metadata(source / "kernel.json")
+            argv = specification.get("argv")
+            python = PurePosixPath(argv[0].replace("\\", "/")) if (
+                isinstance(argv, list) and argv and isinstance(argv[0], str)) else None
+            suffix = ("projects", project.kind, project.name, ".venv")
+            if (python is None or not (python.is_absolute() or Path(argv[0]).is_absolute())
+                    or python.parts[-6:-2] != suffix or python.parts[-2:] not in {
+                        ("bin", "python"), ("Scripts", "python.exe")}):
                 raise HTTPException(409, "Kernel 注册不属于该项目环境，未删除任何文件")
+            metadata = specification.get("metadata", {})
+            if not isinstance(metadata, dict):
+                raise HTTPException(409, "Kernel 注册身份无效，未删除任何文件")
+            owner = metadata.get("solo")
+            if owner is not None and owner != {
+                    "project_id": str(project.id), "path": f"projects/{project.kind}/{project.name}"}:
+                raise HTTPException(409, "Kernel 注册身份与项目不一致，未删除任何文件")
 
 
 def stage_sources(paths: list[dict], expected: dict, moved: list[dict]) -> None:
@@ -306,7 +320,7 @@ def stage_sources(paths: list[dict], expected: dict, moved: list[dict]) -> None:
         if staged.exists() or staged.is_symlink() or staged.is_junction():
             raise HTTPException(409, "项目清理暂存路径已被占用，未继续删除")
         require_identity(read_metadata(container / "metadata.json"), expected)
-        source.rename(staged)  # Kernel stage stays inside the kernelspec mount, never /shared.
+        source.rename(staged)  # Kernel staging stays inside the mounted kernels directory.
         moved.append(item)
 
 

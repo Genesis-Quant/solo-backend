@@ -6,6 +6,7 @@ from threading import Event, Thread
 from time import monotonic
 
 from config import DolphinSchedulerSettings as Settings
+from config import SoloSettings
 
 
 def wait_for_gateway(timeout: float = 60) -> None:
@@ -76,7 +77,10 @@ def sync_workflows() -> dict[str, int]:
             Shell(
                 name=kind,
                 command=f'exec {Settings.RUNTIME_COMMAND} apps {kind} --input-file "${{input_file}}"',
-                description="读取共享 input.json，在锁定 uv 环境运行，报告写回 /shared/runs",
+                description=(
+                    "读取共享 input.json，在锁定 uv 环境运行，"
+                    f"报告写回 {SoloSettings.SHARED_DIR.as_posix()}/runs"
+                ),
                 worker_group=Settings.WORKER_GROUP,
                 fail_retry_times=0,
             )

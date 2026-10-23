@@ -1,12 +1,10 @@
-"""在共享目录创建 uv 环境，注册 Jupyter 能直接发现的 Kernel。"""
+"""Delegate project environments to Jupyter, where their absolute paths are valid."""
 
 import json
-import os
-import subprocess
 from pathlib import Path
 
+import requests
 from config import SoloSettings
-from core.utils.uv import uv_environment
 
 
 class EnvironmentError(Exception):
@@ -14,49 +12,67 @@ class EnvironmentError(Exception):
 
 
 def kernel_directory(project_id: str) -> Path:
-    return SoloSettings.HOME_DIR / ".jupyter" / "kernels" / f"solo-{project_id}"
+    return SoloSettings.SHARED_DIR / "kernels" / f"solo-{project_id}"
 
 
-def prepare_environment(directory: Path, project_id: str, name: str, *, locked: bool = False) -> None:
-    env = {
-        **os.environ,
-        "UV_PROJECT_ENVIRONMENT": str(directory / ".venv"),
-        "UV_PYTHON_INSTALL_DIR": str(SoloSettings.HOME_DIR / ".python"),
-        "UV_PYTHON_BIN_DIR": "/tmp/solo-python-bin",
-        **uv_environment(directory),
-        "GIT_TERMINAL_PROMPT": "0",
-    }
+def request_environment(directory: Path, project_id: str, name: str, *, locked: bool = False,
+                        mode: str = "prepare") -> None:
     try:
-        result = subprocess.run(
-            ["uv", "sync", "--project", str(directory), "--python", "3.12", "--managed-python",
-             *(["--locked"] if locked else [])],
-            env=env, capture_output=True, text=True, timeout=600,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise EnvironmentError("项目环境安装超时，请检查依赖下载网络后重试") from error
-    if result.returncode:
-        # 只返回 uv 的最后一段错误，避免将父进程环境或认证信息发给浏览器。
-        message = result.stderr[-3000:]
+        path = directory.resolve().relative_to(SoloSettings.SHARED_DIR.resolve()).as_posix()
+    except ValueError as error:
+        raise EnvironmentError("项目环境路径不在共享目录内") from error
+    headers = {"Authorization": f"token {SoloSettings.JUPYTER_TOKEN}"} if SoloSettings.JUPYTER_TOKEN else {}
+
+    def redact(message: str) -> str:
         for secret in (SoloSettings.GITEE_TOKEN, SoloSettings.JUPYTER_TOKEN):
             if secret:
                 message = message.replace(secret, "[REDACTED]")
-        raise EnvironmentError(f"项目环境安装失败：\n{message}")
-    python = directory / ".venv" / "bin" / "python"
-    result = subprocess.run([str(python), "-c", "import ipykernel"], capture_output=True, timeout=30)
-    if result.returncode:
-        raise EnvironmentError("模板的开发依赖缺少 ipykernel，无法注册项目 Kernel")
-    kernel = kernel_directory(project_id)
-    kernel.mkdir(parents=True, exist_ok=True)
-    kernel_name = f"solo-{project_id}"
-    (kernel / "kernel.json").write_text(json.dumps({
-        "argv": [str(python), "-m", "ipykernel_launcher", "-f", "{connection_file}"],
-        "display_name": name,
-        "language": "python",
-        "env": {"UV_PROJECT_ENVIRONMENT": str(directory / ".venv")},
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
-    notebook_path = directory / "research.ipynb"
-    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
-    notebook.setdefault("metadata", {})["kernelspec"] = {
-        "name": kernel_name, "display_name": name, "language": "python",
-    }
-    notebook_path.write_text(json.dumps(notebook, ensure_ascii=False, indent=2), encoding="utf-8")
+        return message[-3000:]
+
+    try:
+        with requests.Session() as client:
+            client.trust_env = False
+            response = client.post(
+                SoloSettings.JUPYTER_API_URL + "/solo/project/environment",
+                headers=headers, json={"path": path, "project_id": project_id, "name": name,
+                                       "locked": locked, "mode": mode},
+                timeout=(3, 650), allow_redirects=False,
+            )
+        if response.status_code != 200:
+            try:
+                body = response.json()
+                # Jupyter 把具体原因放在 reason，message 只是 HTTP 状态的通用短语。
+                message = body.get("reason") or body.get("message") or "Jupyter 环境服务请求失败"
+            except (ValueError, AttributeError):
+                message = "Jupyter 环境服务请求失败"
+            raise EnvironmentError(f"项目环境安装失败：\n{redact(str(message))}")
+    except requests.Timeout:
+        raise EnvironmentError("项目环境安装超时，请检查 Jupyter 服务和依赖下载网络后重试") from None
+    except requests.RequestException:
+        raise EnvironmentError("无法连接 Jupyter 项目环境服务，请稍后重试") from None
+
+
+def prepare_environment(directory: Path, project_id: str, name: str, *, locked: bool = False) -> None:
+    request_environment(directory, project_id, name, locked=locked)
+
+
+def sync_environment(directory: Path) -> None:
+    directory = directory.resolve()
+    shared = SoloSettings.SHARED_DIR.resolve()
+    if not directory.is_relative_to(shared) or directory == shared:
+        raise EnvironmentError("项目环境路径不在共享目录内")
+    current = directory
+    while current != shared:
+        marker = current / ".solo"
+        if marker.exists():
+            try:
+                if not marker.resolve().is_relative_to(shared):
+                    raise ValueError("Metadata outside shared directory")
+                metadata = json.loads(marker.read_text(encoding="utf-8"))
+                project_id, name = metadata["project_id"], metadata["name"]
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                raise EnvironmentError("项目缺少有效的 .solo 身份") from error
+            request_environment(directory, project_id, name, mode="sync")
+            return
+        current = current.parent
+    raise EnvironmentError("项目缺少有效的 .solo 身份")

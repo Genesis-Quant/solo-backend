@@ -20,7 +20,7 @@ from core.apps.projects.views import Database
 from core.scheduler.client import DolphinSchedulerClient, DolphinSchedulerError
 
 from .models import Strategy
-from .service import ComponentInspector, KINDS, build, selected
+from .service import KINDS, ComponentInspector, build, selected
 
 router = APIRouter(prefix="/api/v1/strategies", tags=["strategies"])
 
@@ -72,6 +72,7 @@ def list_strategies(session: Database) -> list[dict]:
 @router.post("/forms")
 def forms(body: Selection, session: Database) -> dict:
     try:
+        lock_registry(session)
         components = selected(session, body.model_dump())
         inspector = ComponentInspector(components)
         return {kind: inspector.inspect(kind) for kind in KINDS}
@@ -98,7 +99,8 @@ def create_strategy(body: CreateStrategy, session: Database) -> dict:
             descriptors[kind] = descriptor
         strategy = Strategy(name=body.name.strip(), forms=body.forms, components=descriptors)
         session.add(strategy)
-        session.commit()
+        # 冻结副本及接受快照完成前不能提交，否则会提前释放成果仓库锁。
+        session.flush()
         directory = SoloSettings.SHARED_DIR / "runs" / str(strategy.id)
         try:
             strategy.scheme_version = build(components, body.forms, directory)

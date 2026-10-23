@@ -15,7 +15,9 @@ from sqlalchemy import func, select
 
 from config import DolphinSchedulerSettings, SoloSettings
 from core.apps import version_policy as policy
-from core.scheduler.client import DolphinSchedulerClient, DolphinSchedulerError
+from core.scheduler.client import (
+    DolphinSchedulerClient, DolphinSchedulerError, instance_input_file, worker_input_file,
+)
 from core.scheduler.task_logs import worker_task_log_page
 
 from .models import Project, ProjectDeletion, ProjectVersion
@@ -63,8 +65,7 @@ def refresh_version(version: ProjectVersion, *, workflow_kind: str | None = None
                 while True:
                     instances = client.instances(workflow_kind or data["kind"], page=page)
                     for instance in instances:
-                        params = json.loads(instance.get("globalParams") or "[]")
-                        if any(p.get("prop") == "input_file" and p.get("value") == str(directory / "input.json") for p in params):
+                        if instance_input_file(instance) == worker_input_file((directory / "input.json").as_posix()):
                             version.workflow_id = instance["id"]
                             break
                     if version.workflow_id or len(instances) < 100:

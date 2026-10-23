@@ -4,6 +4,7 @@ Callers own database transactions. Registered wheels have fresh UUID directories
 """
 
 import json
+import os
 import re
 import shutil
 import tomllib
@@ -270,8 +271,9 @@ def _bundle(artifact: ResearchArtifact, directory: Path, data: dict, lockfile: P
     if final.exists():
         raise ArtifactError("Publication bundle already exists; refusing to overwrite it", "artifact_conflict")
     config = tomllib.loads(checked_path(lockfile.parent / "pyproject.toml", directory).read_text(encoding="utf-8"))
-    destinations = {name: artifact_path(registered[name]) if name in registered else final / "wheels" / name / path.name
-                    for name, path in assets.items()}
+    destinations = {name: final / "wheels" / name / path.name for name, path in assets.items()}
+    environment = final / "environment"
+    relative = {name: Path(os.path.relpath(path, environment)).as_posix() for name, path in destinations.items()}
     uv = config.setdefault("tool", {}).setdefault("uv", {})
     sources = uv.setdefault("sources", {})
     # Only locked sources participate in publication; unused development sources do not.
@@ -280,12 +282,12 @@ def _bundle(artifact: ResearchArtifact, directory: Path, data: dict, lockfile: P
         if name not in destinations and any({"path", "directory", "editable"} & location.keys() for location in locations):
             del sources[name]
     for name, target in destinations.items():
-        sources[name] = {"path": str(target)}
+        sources[name] = {"path": relative[name]}
     derivative_lock = deepcopy(lock)
     for item in derivative_lock["package"]:
         name = canonicalize_name(item["name"])
         if name in destinations:
-            item["source"] = {"path": str(destinations[name])}
+            item["source"] = {"path": relative[name]}
             item.pop("sdist", None)
             # Preserve uv's existing wheel metadata; publication only rebases paths.
             item["wheels"] = [{**{key: value for key, value in wheel.items() if key not in {"path", "url"}},
@@ -299,7 +301,7 @@ def _bundle(artifact: ResearchArtifact, directory: Path, data: dict, lockfile: P
             if name in destinations and any(key in value for key in ("path", "url", "index")):
                 value.pop("url", None)
                 value.pop("index", None)
-                value["path"] = destinations[name].as_posix()
+                value["path"] = relative[name]
             for item in value.values():
                 rebase_requirements(item)
         elif isinstance(value, list):
@@ -309,17 +311,16 @@ def _bundle(artifact: ResearchArtifact, directory: Path, data: dict, lockfile: P
     for item in derivative_lock["package"]:
         rebase_requirements(item.get("metadata", {}))
     derivative_input = deepcopy(data)
-    derivative_input["environment"]["lockfile"] = str(final / "environment" / "uv.lock")
-    derivative_input["output"] = str(final / "report")
+    derivative_input["environment"]["lockfile"] = "environment/uv.lock"
+    derivative_input["output"] = "report"
     for component in policy.task_components(derivative_input).values():
-        component["wheel"] = str(destinations[canonicalize_name(component["package"])])
+        component["wheel"] = destinations[canonicalize_name(component["package"])].relative_to(final).as_posix()
     final.mkdir()
     created.append(final)
     for name, source in assets.items():
-        if name not in registered:
-            target = destinations[name]
-            target.parent.mkdir(parents=True)
-            shutil.copyfile(source, target)
+        target = destinations[name]
+        target.parent.mkdir(parents=True)
+        shutil.copyfile(source, target)
     environment = final / "environment"
     environment.mkdir()
     (environment / "pyproject.toml").write_text(tomlkit.dumps(config), encoding="utf-8")
@@ -396,6 +397,7 @@ def artifact_component(session: Session, identifier: UUID | str) -> dict:
     if artifact.published_at is None or artifact.kind == "dependency":
         raise ArtifactError("Strategy selection requires a published research artifact")
     root, data = verify_bundle(artifact)
+    data["environment"]["lockfile"] = str(checked_path(root / data["environment"]["lockfile"], root))
     component = deepcopy(data["factor"] if artifact.kind == "factor" else data["algos"][artifact.kind])
     component["wheel"] = str(checked_path(artifact_path(artifact)))
     snapshot = artifact_snapshot(artifact)

@@ -10,7 +10,6 @@ import tomlkit
 from fastapi import HTTPException
 from packaging.utils import canonicalize_name
 
-from config import SoloSettings
 from core.apps import version_policy as policy
 from core.apps.projects.models import Project, ProjectVersion
 from core.apps.projects.versions import version_directory
@@ -79,8 +78,7 @@ def scheme_source(components: dict) -> tuple[str, list[dict]]:
 
 
 def command(args: list[str], cwd: Path, data: dict | None = None) -> str:
-    env = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(cwd / ".venv"),
-           "UV_PYTHON_INSTALL_DIR": str(SoloSettings.HOME_DIR / ".python"), **uv_environment(cwd)}
+    env = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(cwd / ".venv"), **uv_environment(cwd)}
     for key in ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME"):
         env.pop(key, None)
     try:
@@ -117,7 +115,9 @@ def selected(session, selections: dict[str, UUID | None | dict[str, UUID]]) -> d
         if not project or project.kind != kind or project.archived or version.status != "success":
             raise HTTPException(422, f"{kind} 必须选择对应类型的成功研究版本")
         source = json.loads((version_directory(version) / "input.json").read_text(encoding="utf-8"))
+        source["environment"]["lockfile"] = str(policy.file_in_run(version_directory(version), source["environment"]["lockfile"]))
         component = source["algos"][kind]
+        component["wheel"] = str(policy.file_in_run(version_directory(version), component["wheel"]))
         snapshots = version.accepted_artifacts or {}
         root_snapshot = snapshots.get(canonicalize_name(component["package"]), {})
         result[kind] = {"label": f"{project.name} · v{version.number}", "project_id": str(project.id),
@@ -194,6 +194,7 @@ def build(components: dict, forms: dict, destination: Path) -> str:
     scheme_version, scheme_locations = scheme_source(components)
     candidates, identities, roots, algos, configs = {}, {}, [], {}, {}
     destination.mkdir(parents=True, exist_ok=False)
+    pinned: dict[str, set[str]] = {}
     for kind, item in components.items():
         if not has_component(item):
             continue
@@ -201,6 +202,10 @@ def build(components: dict, forms: dict, destination: Path) -> str:
         environment = Path(item["input"]["environment"]["lockfile"]).parent
         config = tomllib.loads((environment / "pyproject.toml").read_text(encoding="utf-8"))
         configs[kind] = config["tool"]["uv"]
+        frozen = tomllib.loads((environment / "uv.lock").read_text(encoding="utf-8"))
+        for p in frozen["package"]:
+            if not {"virtual", "directory", "editable"} & p["source"].keys() and (p["name"] != "scheme" or kind == "model"):
+                pinned.setdefault(p["name"], set()).add(p["version"])
         for name, entries in configs[kind]["sources"].items():
             name = canonicalize_name(name)
             if name == "scheme":
@@ -245,26 +250,29 @@ def build(components: dict, forms: dict, destination: Path) -> str:
             copied.add(target.name)
             shutil.copy2(original, target)
         if len(copied) == 1:
-            sources[name] = {"path": str(target)}
+            sources[name] = {"path": Path(os.path.relpath(target, destination / "environment")).as_posix()}
         else:
             index = f"wheels-{name}"
             if any(item.get("name") == index for item in indexes):
                 raise ValueError(f"本地 wheel 索引 {index} 与继承的 registry 名称冲突")
-            indexes.append({"name": index, "url": str(directory), "format": "flat"})
+            indexes.append({"name": index, "url": Path(os.path.relpath(directory, destination / "environment")).as_posix(), "format": "flat"})
             sources[name] = {"index": index}
     for component in algos.values():
-        component["wheel"] = sources[canonicalize_name(component["package"])]["path"]
+        wheel = destination / "environment" / sources[canonicalize_name(component["package"])]["path"]
+        component["wheel"] = wheel.resolve().relative_to(destination.resolve()).as_posix()
+    # 各组件冻结版本不一致的包不加约束，否则互斥的 == 约束会让 uv lock 无解。
+    constraints = sorted(f"{name}=={versions.pop()}" for name, versions in pinned.items() if len(versions) == 1)
     environment = destination / "environment"
     environment.mkdir()
     (environment / "pyproject.toml").write_text(tomlkit.dumps({
         "project": {"name": "strategy-environment", "version": "0.0.0", "requires-python": ">=3.12,<3.13", "dependencies": roots},
-        "tool": {"uv": {"package": False, "sources": sources, **registry, "constraint-dependencies": list(sources)}},
+        "tool": {"uv": {"package": False, "sources": sources, **registry, "constraint-dependencies": constraints}},
     }), encoding="utf-8")
     command(["uv", "lock", "--project", str(environment)], environment)
     frozen = policy.require_locked_scheme(tomllib.loads((environment / "uv.lock").read_text(encoding="utf-8")))
     if frozen != policy.formal_version(scheme_version):
         raise ValueError("策略冻结环境改变了所选 Model 的 ActualScheme")
-    data = {"kind": "strategy", "environment": {"lockfile": str(environment / "uv.lock")},
-            "algos": algos, "backtest": backtest, "output": str(destination / "report")}
+    data = {"kind": "strategy", "environment": {"lockfile": "environment/uv.lock"},
+            "algos": algos, "backtest": backtest, "output": "report"}
     (destination / "input.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return scheme_version

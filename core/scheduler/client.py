@@ -7,6 +7,7 @@ from typing import Any, Self
 
 import requests
 from config import DolphinSchedulerSettings as Settings
+from config import SoloSettings
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -44,16 +45,27 @@ def instance_input_file(instance: dict[str, Any]) -> str | None:
 
 def validate_input_file(input_file: str) -> str:
     """DS 会把参数替换进 Shell，因此只接受共享目录内的安全绝对路径。"""
-    path = PurePosixPath(input_file)
-    if (
-        not re.fullmatch(r"/shared/runs/[\w./-]+\.json", input_file)
-        or ".." in path.parts
-        or str(path) != input_file
-    ):
-        raise ValueError(
-            "input_file 必须是 /shared/runs 下的 JSON 路径，仅允许字母、数字、下划线、点、横线和目录分隔符"
-        )
-    return input_file
+    runs = PurePosixPath(SoloSettings.SHARED_DIR.as_posix()) / "runs"
+    if isinstance(input_file, str) and re.fullmatch(r"/[\w.-]+(?:/[\w.-]+)*\.json", input_file):
+        path = PurePosixPath(input_file)
+        if (
+            runs.is_absolute()
+            and path.is_relative_to(runs)
+            and ".." not in path.parts
+            and str(path) == input_file
+        ):
+            return input_file
+    raise ValueError(
+        f"input_file 必须是 {runs} 下的规范绝对 POSIX JSON 路径，"
+        "仅允许字母、数字、下划线、点、横线和目录分隔符"
+    )
+
+
+def worker_input_file(input_file: str) -> str:
+    """Validate the backend identity before rebasing onto the worker's runs-only mount."""
+    path = PurePosixPath(validate_input_file(input_file))
+    runs = PurePosixPath(SoloSettings.SHARED_DIR.as_posix()) / "runs"
+    return str(PurePosixPath("/runs") / path.relative_to(runs))
 
 
 class DolphinSchedulerClient:
@@ -133,7 +145,7 @@ class DolphinSchedulerClient:
         return result.get("processDefinition", result)
 
     def start(self, kind: str, input_file: str) -> Any:
-        input_file = validate_input_file(input_file)
+        input_file = worker_input_file(input_file)
         project = self.project_code()
         definition = self.definition(project, kind)
         return self.request(
@@ -203,7 +215,7 @@ class DolphinSchedulerClient:
         if (not isinstance(instance, dict) or instance.get("id") != instance_id
                 or instance.get("processDefinitionCode") != definition
                 or instance.get("projectCode", project) != project
-                or instance_input_file(instance) != input_file):
+                or instance_input_file(instance) != worker_input_file(input_file)):
             raise DolphinSchedulerError("DolphinScheduler 实例不属于该研究任务，未执行删除")
         state = instance.get("state")
         if not isinstance(state, str):
@@ -214,13 +226,17 @@ class DolphinSchedulerClient:
     def owned_instances(self, kind: str, input_files: set[str],
                         known_instances: dict[int, str]) -> list[dict[str, Any]]:
         project, definition, instances = self.instance_index(kind)
+        identities = {worker_input_file(path): path for path in input_files}
         owned = []
         for instance in instances:
-            input_file = instance_input_file(instance)
+            identity = instance_input_file(instance)
             if instance["id"] in known_instances:
-                if input_file != known_instances[instance["id"]]:
+                input_file = known_instances[instance["id"]]
+                if identity != worker_input_file(input_file):
                     raise DolphinSchedulerError("DolphinScheduler 任务 ID 与输入身份不一致，未执行删除")
-            elif input_file not in input_files:
+            elif identity in identities:
+                input_file = identities[identity]
+            else:
                 continue
             self.require_owned_instance(instance, project=project, definition=definition,
                                         instance_id=instance["id"], input_file=input_file)

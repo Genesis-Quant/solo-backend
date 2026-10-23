@@ -1,4 +1,4 @@
-"""Delete only an artifact's owned directory after checking live UUID references."""
+"""Delete an artifact's owned directory after checking project and artifact references."""
 
 import json
 import shutil
@@ -7,13 +7,13 @@ from pathlib import Path
 from threading import Lock
 from uuid import UUID
 
+from config import SoloSettings
 from fastapi import HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from config import SoloSettings
 from core.apps.projects.models import Project
-from core.apps.strategies.models import Strategy
+
 from . import service
 from .models import ResearchArtifact
 
@@ -75,12 +75,9 @@ def require_unused(session: Session, artifact: ResearchArtifact) -> None:
     for other in session.scalars(select(ResearchArtifact).where(ResearchArtifact.id != artifact.id)):
         if _references(other.dependencies, artifact.id):
             refs.append({"type": "artifact", "id": str(other.id), "package": other.package_name})
-    for strategy in session.scalars(select(Strategy)):
-        if _references(strategy.components, artifact.id) or _references(strategy.accepted_artifacts, artifact.id):
-            refs.append({"type": "strategy", "id": str(strategy.id), "name": strategy.name})
     if refs:
         raise HTTPException(409, {"code": "artifact_in_use",
-            "reason": "该成果仍被项目、策略或其他成果依赖闭包引用，不能删除", "refs": refs})
+            "reason": "该成果仍被项目或其他成果依赖闭包引用，不能删除", "refs": refs})
 
 
 def _directory(path: Path, root: Path) -> bool:
