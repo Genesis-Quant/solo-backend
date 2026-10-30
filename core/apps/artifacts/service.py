@@ -343,6 +343,12 @@ def verify_bundle(artifact: ResearchArtifact) -> tuple[Path, dict]:
 def publish_version(session: Session, project: Project, version: ProjectVersion, *,
                     created: list[Path] | None = None) -> ResearchArtifact:
     lock_registry(session)
+    from core.apps.projects.models import VersionDeletion
+
+    current = session.scalar(select(ProjectVersion).where(ProjectVersion.id == version.id).with_for_update()
+                             .execution_options(populate_existing=True))
+    if current is None or session.get(VersionDeletion, version.id):
+        raise ArtifactError("Saved version is being deleted or no longer exists")
     if version.project_id != project.id or version.status != "success":
         raise ArtifactError("Only the owning Project's successful saved result can be published")
     snapshots = policy.snapshot_values(version.accepted_artifacts)
@@ -411,7 +417,7 @@ def artifact_component(session: Session, identifier: UUID | str) -> dict:
         "accepted_artifacts": {artifact.package_name: snapshot, **deepcopy(artifact.dependencies)}}
 
 
-def gc_unreferenced(session: Session) -> dict[str, int]:
+def gc_unreferenced(session: Session, *, candidates: set[str] | None = None) -> dict[str, int]:
     """Remove unreferenced unpublished artifacts without consulting descriptive origins."""
     from core.apps.strategies.models import Strategy
     lock_registry(session)
@@ -431,14 +437,16 @@ def gc_unreferenced(session: Session) -> dict[str, int]:
             if identifier not in retained:
                 retained.add(identifier)
                 pending.append(identifier)
-    removed = 0
+    removed, freed = 0, 0
     for artifact in artifacts:
-        if str(artifact.id) not in retained:
+        identifier = str(artifact.id)
+        if identifier not in retained and (candidates is None or identifier in candidates):
             directory = artifact_path(artifact).parent
             if directory.exists():
                 checked_path(directory, directory.parent, directory=True)
                 shutil.rmtree(directory)
             session.delete(artifact)
             removed += 1
+            freed += artifact.size_bytes
     session.flush()
-    return {"removed": removed, "retained": len(artifacts) - removed}
+    return {"removed": removed, "retained": len(artifacts) - removed, "freedBytes": freed}

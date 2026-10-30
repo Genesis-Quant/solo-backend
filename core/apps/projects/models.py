@@ -45,6 +45,7 @@ class Project(Base):
     scheme_version: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="创建项目时选择的 scheme Git Tag；旧项目未记录时为空")
     scheme_commit: Mapped[str | None] = mapped_column(String(40), nullable=True, comment="实际使用的 scheme Git commit SHA")
     archived: Mapped[bool] = mapped_column(Boolean, default=False, comment="是否已删除隐藏；源码和成果保留")
+    version_sequence: Mapped[int] = mapped_column(Integer, default=0, server_default="0", comment="已分配的最大版本编号；删除版本后不复用")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, comment="创建时间（UTC）")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, comment="更新时间（UTC）")
     versions: Mapped[list["ProjectVersion"]] = relationship(
@@ -70,12 +71,28 @@ class ProjectVersion(Base):
     note: Mapped[str] = mapped_column(String(500), default="", comment="版本备注")
     status: Mapped[str] = mapped_column(String(32), default="building", comment="building/queued/running/success/failed/submit_failed")
     workflow_id: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="DolphinScheduler 实例 ID")
+    attempt: Mapped[int] = mapped_column(Integer, default=1, server_default="1", comment="任务运行次数")
+    scheduler_run_times: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="本次重试已接受的调度运行次数")
     accepted_artifacts: Mapped[dict | None] = mapped_column(JSON, default=dict, nullable=True, comment="任务接受时冻结的 package 到 artifact 快照；旧记录允许 NULL")
     parameters: Mapped[dict] = mapped_column(JSON, default=dict, comment="冻结的输入参数")
     scheme_version: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="任务实际 Scheme 版本")
     error: Mapped[str] = mapped_column(Text, default="", comment="构建或运行错误")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class VersionDeletion(Base):
+    """保留到 run 和调度资源回收完成，失败后可按原版本 ID 重试。"""
+
+    __tablename__ = "version_deletions"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    project_id: Mapped[UUID] = mapped_column(Uuid, nullable=False, index=True)
+    number: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class ProjectDeletion(Base):

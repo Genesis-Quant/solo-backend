@@ -4,21 +4,17 @@ import re
 import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Literal
 from uuid import UUID
-from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import PlainTextResponse
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
+from sqlalchemy.orm import object_session
 
-from config import DolphinSchedulerSettings, SoloSettings
+from config import SoloSettings
 from core.apps import version_policy as policy
-from core.scheduler.client import (
-    DolphinSchedulerClient, DolphinSchedulerError, instance_input_file, worker_input_file,
-)
-from core.scheduler.task_logs import worker_task_log_page
+from core.apps.tasks import services as task_service
+from core.scheduler.client import DolphinSchedulerClient, DolphinSchedulerError
 
 from .models import Project, ProjectDeletion, ProjectVersion
 from .views import Database, get_project_or_404, project_directory
@@ -45,59 +41,15 @@ def research_dependencies(lockfile: Path, current_package: str) -> list[dict[str
 
 
 def refresh_version(version: ProjectVersion, *, workflow_kind: str | None = None) -> None:
-    if version.status not in {"queued", "running"}:
-        return
-    directory = version_directory(version)
-    try:
-        data, _, lock = policy.task_files(directory, workflow_kind or json.loads(
-            (directory / "input.json").read_text(encoding="utf-8"))["kind"])
-        actual, _ = policy.locked_scheme(lock)
-        if version.scheme_version and policy.formal_version(version.scheme_version) != actual:
-            raise ValueError("任务 ActualScheme 与冻结环境不一致")
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        version.status, version.error = "failed", f"任务文件无效：{error}"
-        version.finished_at = datetime.now(UTC)
-        return
-    try:
-        with DolphinSchedulerClient() as client:
-            if not version.workflow_id:
-                page = 1
-                while True:
-                    instances = client.instances(workflow_kind or data["kind"], page=page)
-                    for instance in instances:
-                        if instance_input_file(instance) == worker_input_file((directory / "input.json").as_posix()):
-                            version.workflow_id = instance["id"]
-                            break
-                    if version.workflow_id or len(instances) < 100:
-                        break
-                    page += 1
-            if not version.workflow_id:
-                return
-            instance = client.instance(version.workflow_id)
-    except DolphinSchedulerError:
-        return  # 调度服务暂时不可用不改变本地任务状态。
-    state = instance["state"]
-    version.error = ""
-    if state == "SUCCESS":
-        try:
-            run = json.loads((directory / "report/run.json").read_text(encoding="utf-8"))
-            if run["status"] != "success" or policy.formal_version(run["versions"]["scheme"]) != actual:
-                raise ValueError("报告 ActualScheme 或状态与任务不一致")
-            version.scheme_version, version.status = str(actual), "success"
-        except (OSError, KeyError, ValueError, TypeError) as error:
-            version.status, version.error = "failed", f"报告清单无效：{error}"
-    elif state in {"FAILURE", "STOP", "KILL", "PAUSE"}:
-        version.status, version.error = "failed", f"DolphinScheduler：{state}，请查看任务日志"
-    else:
-        version.status = "running"
-    if version.status in {"success", "failed"}:
-        version.finished_at = datetime.now(UTC)
+    session = object_session(version)
+    if session is None:
+        raise ValueError("任务状态同步需要数据库会话")
+    kind = workflow_kind or session.get(Project, version.project_id).kind
+    task_service.synchronize(session, version, kind)
 
 
 def read_version(version: ProjectVersion) -> dict:
-    seconds = int(((version.finished_at or datetime.now(UTC)) - version.created_at).total_seconds())
     reason = policy.version_retirement(version)
-    from sqlalchemy.orm import object_session
     from core.apps.artifacts.models import ResearchArtifact
     from core.apps.artifacts.service import read_artifact
 
@@ -112,17 +64,20 @@ def read_version(version: ProjectVersion) -> dict:
             artifact = session.get(ResearchArtifact, UUID(snapshot["id"]))
         break
     artifact_data = read_artifact(artifact) if artifact is not None else None
+    project = session.get(Project, version.project_id)
+    execution = task_service.record_summary(session, version, project.kind)
     return {
         "id": str(version.id), "number": version.number, "packageVersion": version.package_version,
+        **execution,
         "retired": bool(reason), "retiredReason": reason,
         "note": version.note, "submittedAt": version.created_at.isoformat(),
-        "status": "failed" if version.status == "submit_failed" else version.status if version.status in {"success", "failed"} else "running",
+        "status": "failed" if version.status == "submit_failed" else version.status if version.status in {"success", "failed", "stopped"} else "running",
         "phase": version.status, "publishStatus": "published" if artifact is not None and artifact.published_at else "unpublished",
         "artifactId": str(artifact.id) if artifact is not None else None, "artifact": artifact_data,
         "files": ([{"name": artifact.filename, "size": artifact.size_bytes,
                     "url": f"/api/v1/artifacts/{artifact.id}/wheel"}] if artifact is not None else []),
         "workflowId": version.workflow_id or 0,
-        "duration": f"{seconds}s", "error": version.error,
+        "error": version.error,
         "reportPath": f"{version.id}/report" if version.status == "success" else None,
         "parameters": {k: json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v for k, v in version.parameters.items()},
         "dependencies": (
@@ -162,7 +117,9 @@ def create_version(project_id: UUID, body: CreateVersion, session: Database) -> 
         raise HTTPException(422, error.detail) from error
     if session.scalar(select(ProjectVersion.id).where(ProjectVersion.project_id == project_id, ProjectVersion.status == "building")):
         raise HTTPException(409, "当前项目已有版本正在构建")
-    number = (session.scalar(select(func.max(ProjectVersion.number)).where(ProjectVersion.project_id == project_id)) or 0) + 1
+    # 删除版本后编号不复用，避免新版本与历史策略、报告中的 vN 及包版本混淆。
+    latest = session.scalar(select(func.max(ProjectVersion.number)).where(ProjectVersion.project_id == project_id)) or 0
+    number = max(project.version_sequence or 0, latest) + 1
     try:
         # 标签不代表实际版本；使用项目已解析的本地冻结环境，不访问远端。
         lock = tomllib.loads((project_directory(project) / "uv.lock").read_text(encoding="utf-8"))
@@ -174,6 +131,7 @@ def create_version(project_id: UUID, body: CreateVersion, session: Database) -> 
         raise HTTPException(422, "项目环境尚未记录有效的 Scheme 主、次版本") from error
     version = ProjectVersion(project_id=project_id, number=number, package_version=f"{scheme.major}.{scheme.minor}.{number}", note=body.note)
     session.add(version)
+    project.version_sequence = number
     project.updated_at = datetime.now(UTC)
     session.commit()
     return read_version(version)
@@ -184,7 +142,7 @@ def submit_version(project_id: UUID, version_id: UUID, body: BuildResult, sessio
     version = session.scalar(select(ProjectVersion).where(ProjectVersion.id == version_id, ProjectVersion.project_id == project_id).with_for_update())
     if version is None:
         raise HTTPException(404, "版本不存在")
-    if version.status in {"queued", "running"}:
+    if version.status in {"queued", "running", "stopping", "retrying"}:
         refresh_version(version, workflow_kind=session.get(Project, project_id).kind)
         session.commit()
         return read_version(version)
@@ -285,6 +243,14 @@ def cancel_build(project_id: UUID, version_id: UUID, session: Database) -> dict:
     return read_version(version)
 
 
+@router.delete("/{project_id}/versions/{version_id}")
+def delete_version(project_id: UUID, version_id: UUID, session: Database) -> dict:
+    """删除已结束且未发布的版本，并回收调度实例、run 目录和仅被它引用的候选包。"""
+    from .deletion import delete_version as remove_version
+
+    return remove_version(project_id, version_id, session)
+
+
 @router.get("/{project_id}/versions")
 def list_versions(project_id: UUID, session: Database) -> list[dict]:
     project = get_project_or_404(session, project_id)
@@ -292,99 +258,3 @@ def list_versions(project_id: UUID, session: Database) -> list[dict]:
         refresh_version(version, workflow_kind=project.kind)
     session.commit()
     return [read_version(version) for version in project.versions]
-
-
-@router.get("/{project_id}/versions/{version_id}/tasks")
-def version_tasks(project_id: UUID, version_id: UUID, session: Database) -> dict:
-    version = get_version(session, project_id, version_id)
-    refresh_version(version, workflow_kind=session.get(Project, project_id).kind)
-    session.commit()
-    return workflow_tasks(version.workflow_id, version.status, version.error)
-
-
-def workflow_tasks(workflow_id: int | None, status: str, error: str) -> dict:
-    if not workflow_id:
-        state = "FAILURE" if status in {"failed", "submit_failed"} else "WAIT_TO_RUN"
-        return {"state": state, "error": error, "tasks": []}
-    try:
-        with DolphinSchedulerClient() as client:
-            instance = client.instance(workflow_id)
-            tasks = client.tasks(workflow_id)
-    except DolphinSchedulerError as error:
-        raise HTTPException(502, str(error)) from error
-    return {
-        "state": instance["state"], "error": error,
-        "tasks": [{
-            "task_instance_id": task["id"], "name": task["name"],
-            "state": task["state"], "host": task.get("host"),
-            "duration_seconds": task_duration(task),
-        } for task in tasks],
-    }
-
-
-def task_duration(task: dict) -> float | None:
-    if not task.get("startTime"):
-        return None
-    start = datetime.fromisoformat(task["startTime"])
-    end = datetime.fromisoformat(task["endTime"]) if task.get("endTime") else datetime.now(UTC)
-    # DS 返回的无偏移时间使用调度器时区，而非 Backend 所在机器的时区。
-    timezone = ZoneInfo(DolphinSchedulerSettings.TIME_ZONE)
-    if start.tzinfo is None:
-        start = start.replace(tzinfo=timezone)
-    if end.tzinfo is None:
-        end = end.replace(tzinfo=timezone)
-    return max(0, (end.astimezone(UTC) - start.astimezone(UTC)).total_seconds())
-
-
-def require_workflow_task(client: DolphinSchedulerClient, workflow_id: int | None, task_id: int) -> dict:
-    tasks = client.tasks(workflow_id) if workflow_id else []
-    task = next((item for item in tasks if item["id"] == task_id), None)
-    if task is None:
-        raise HTTPException(404, "该工作流中不存在此 Task")
-    return task
-
-
-@router.get("/{project_id}/versions/{version_id}/logs")
-def version_logs(
-    project_id: UUID, version_id: UUID, session: Database,
-    task_instance_id: int,
-    skip_line_num: Annotated[int, Query(ge=0)] = 0,
-    limit: Annotated[int, Query(ge=1, le=10000)] = 1000,
-    scope: Literal["full", "worker"] = "full",
-    cursor: Annotated[str | None, Query(max_length=512)] = None,
-) -> dict:
-    version = get_version(session, project_id, version_id)
-    return workflow_logs(version.workflow_id, task_instance_id, skip_line_num, limit, scope, cursor)
-
-
-def workflow_logs(workflow_id: int | None, task_instance_id: int, skip_line_num: int = 0,
-                  limit: int = 1000, scope: Literal["full", "worker"] = "full", cursor: str | None = None) -> dict:
-    try:
-        with DolphinSchedulerClient() as client:
-            task = require_workflow_task(client, workflow_id, task_instance_id)
-            if scope == "worker":
-                page = worker_task_log_page(client, task_instance_id=task_instance_id,
-                                            skip_line_num=skip_line_num, limit=limit, cursor=cursor)
-            else:
-                page = client.task_log(task_instance_id=task_instance_id, skip_line_num=skip_line_num, limit=limit)
-    except ValueError as error:
-        raise HTTPException(422, str(error)) from error
-    except DolphinSchedulerError as error:
-        raise HTTPException(502, str(error)) from error
-    return {"workflow_instance_id": workflow_id, "task_instance_id": task_instance_id,
-            "state": task["state"], "scope": scope, **page}
-
-
-@router.get("/{project_id}/versions/{version_id}/logs/download", response_class=PlainTextResponse)
-def download_version_log(project_id: UUID, version_id: UUID, task_instance_id: int, session: Database) -> str:
-    version = get_version(session, project_id, version_id)
-    return download_workflow_log(version.workflow_id, task_instance_id)
-
-
-def download_workflow_log(workflow_id: int | None, task_instance_id: int) -> str:
-    try:
-        with DolphinSchedulerClient() as client:
-            require_workflow_task(client, workflow_id, task_instance_id)
-            return client.download_log(task_instance_id)
-    except DolphinSchedulerError as error:
-        raise HTTPException(502, str(error)) from error

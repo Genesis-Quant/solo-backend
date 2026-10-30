@@ -160,11 +160,14 @@ def validate_template(project: dict, scheme: Version) -> None:
     scheme_requirements = [requirement for requirement in requirements if requirement.name.lower() == "scheme"]
     minimum = Version(f"{scheme.major}.{scheme.minor}.0")
     maximum = Version(f"{scheme.major}.{scheme.minor + 1}.0")
-    message = f"模板必须声明唯一 scheme 依赖，范围包含 {minimum} 且不包含 {maximum}"
+    message = f"模板必须声明唯一 scheme 依赖并限制在 {minimum} 至 {maximum}（不含）系列内"
     if len(scheme_requirements) != 1:
         raise ValueError(message)
     requirement = scheme_requirements[0]
-    if minimum not in requirement.specifier or maximum in requirement.specifier:
+    lower_bounds = [Version(item.version) for item in requirement.specifier
+                    if item.operator in {">=", ">", "==", "~="} and "*" not in item.version]
+    upper_bounds = [item for item in requirement.specifier if item.operator == "<" and Version(item.version) <= maximum]
+    if not lower_bounds or max(lower_bounds) < minimum or not upper_bounds:
         raise ValueError(message)
     if scheme not in requirement.specifier:
         raise ValueError(f"所选 scheme {scheme} 不满足模板依赖：{requirement}")

@@ -292,7 +292,7 @@ def check_task(session, record, *, project=None, kind: str) -> None:
     expected = project.kind if project is not None else "strategy"
     if kind != expected:
         raise VersionPolicyError("任务 kind 与数据库记录不一致", "task_identity_mismatch")
-    if record.status not in {"queued", "running"}:
+    if record.status not in {"queued", "running", "retrying"}:
         raise VersionPolicyError("任务尚未提交或已经结束", "task_not_submitted")
     require_release("scheme", version=record.scheme_version)
     actual = formal_version(record.scheme_version)

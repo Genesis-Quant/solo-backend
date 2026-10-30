@@ -1,7 +1,7 @@
 """FastAPI entry point."""
 
 import logging
-from asyncio import to_thread
+from asyncio import Event, create_task, to_thread
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -10,6 +10,7 @@ from core.apps.artifacts.views import router as artifacts_router
 from core.apps.projects.versions import router as versions_router
 from core.apps.projects.views import router as projects_router
 from core.apps.strategies.views import router as strategies_router
+from core.apps.tasks.views import router as tasks_router
 from core.apps.system.views import health
 from core.apps.system.views import router as system_router
 from core.apps.version_policy_views import router as version_policy_router
@@ -28,13 +29,19 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
             await to_thread(sync_workflows)
         except Exception:
             logging.getLogger(__name__).exception("DolphinScheduler 工作流同步失败，后端继续启动")
+    from core.apps.projects.version_cleanup import run_version_cleanups
+
+    stopped = Event()
+    cleanup = create_task(run_version_cleanups(stopped))
     try:
         yield
     finally:
+        stopped.set()
+        await cleanup
         database_engine().dispose()
 
 
-app = FastAPI(title="Solo Backend", version="0.1.1", lifespan=lifespan)
+app = FastAPI(title="Solo Backend", version="0.1.6", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=SoloSettings.WEB_ORIGINS,
@@ -46,6 +53,7 @@ app.include_router(system_router)
 app.include_router(projects_router)
 app.include_router(versions_router)
 app.include_router(strategies_router)
+app.include_router(tasks_router)
 app.include_router(version_policy_router)
 app.include_router(artifacts_router)
 app.add_api_route("/health", health, methods=["GET"], tags=["system"])

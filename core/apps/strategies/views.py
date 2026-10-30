@@ -1,21 +1,17 @@
 from datetime import UTC, datetime
-from typing import Annotated, Literal
+from typing import Literal
 from uuid import UUID
 
 from config import SoloSettings
-from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import PlainTextResponse
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import select
 
 from core.apps import version_policy as policy
+from core.apps.tasks import services as task_service
+from sqlalchemy.orm import object_session
 from core.apps.artifacts.service import lock_registry
-from core.apps.projects.versions import (
-    download_workflow_log,
-    refresh_version,
-    workflow_logs,
-    workflow_tasks,
-)
+from core.apps.projects.versions import refresh_version
 from core.apps.projects.views import Database
 from core.scheduler.client import DolphinSchedulerClient, DolphinSchedulerError
 
@@ -51,12 +47,13 @@ class CreateStrategy(BaseModel):
 
 def read(strategy: Strategy) -> dict:
     reason = policy.version_retirement(strategy)
+    execution = task_service.record_summary(object_session(strategy), strategy, "strategy")
     return {"id": str(strategy.id), "name": strategy.name, "components": strategy.components,
             "retired": bool(reason), "retiredReason": reason,
             "forms": strategy.forms, "status": strategy.status, "error": strategy.error,
+            **execution,
             "workflowId": strategy.workflow_id, "schemeVersion": strategy.scheme_version,
             "createdAt": strategy.created_at.isoformat(),
-            "duration": f"{max(0, int(((strategy.finished_at or datetime.now(UTC)) - strategy.created_at).total_seconds()))}s",
             "reportPath": f"{strategy.id}/report" if strategy.status == "success" else None}
 
 
@@ -138,28 +135,3 @@ def require_strategy(identifier: UUID, session: Database) -> Strategy:
     if strategy is None:
         raise HTTPException(404, "策略不存在")
     return strategy
-
-
-@router.get("/{identifier}/tasks")
-def strategy_tasks(identifier: UUID, session: Database) -> dict:
-    strategy = require_strategy(identifier, session)
-    refresh_version(strategy, workflow_kind="strategy")
-    session.commit()
-    return workflow_tasks(strategy.workflow_id, strategy.status, strategy.error)
-
-
-@router.get("/{identifier}/logs")
-def strategy_logs(
-    identifier: UUID, session: Database, task_instance_id: int,
-    skip_line_num: Annotated[int, Query(ge=0)] = 0,
-    limit: Annotated[int, Query(ge=1, le=10000)] = 1000,
-    scope: Literal["full", "worker"] = "full",
-    cursor: Annotated[str | None, Query(max_length=512)] = None,
-) -> dict:
-    strategy = require_strategy(identifier, session)
-    return workflow_logs(strategy.workflow_id, task_instance_id, skip_line_num, limit, scope, cursor)
-
-
-@router.get("/{identifier}/logs/download", response_class=PlainTextResponse)
-def strategy_log_download(identifier: UUID, session: Database, task_instance_id: int) -> str:
-    return download_workflow_log(require_strategy(identifier, session).workflow_id, task_instance_id)

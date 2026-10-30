@@ -17,6 +17,8 @@ class Strategy(Base):
     forms: Mapped[dict] = mapped_column(JSON, comment="各环节填写的 Form 参数")
     status: Mapped[str] = mapped_column(String(32), default="building")
     workflow_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=1, server_default="1", comment="任务运行次数")
+    scheduler_run_times: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="本次重试已接受的调度运行次数")
     accepted_artifacts: Mapped[dict | None] = mapped_column(JSON, default=dict, nullable=True, comment="独立策略的冻结 artifact 接受快照；旧记录允许 NULL")
     scheme_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     error: Mapped[str] = mapped_column(Text, default="")

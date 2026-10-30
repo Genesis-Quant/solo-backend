@@ -22,25 +22,44 @@ class DolphinSchedulerBusyError(DolphinSchedulerError):
     """An owned instance has not reached a terminal scheduler state."""
 
 
+class DolphinSchedulerStateError(DolphinSchedulerError):
+    """The owned workflow cannot accept the requested control action."""
+
+
 FINISHED_STATES = frozenset({"SUCCESS", "FAILURE", "STOP", "PAUSE", "BLOCK"})
 
 
 def instance_input_file(instance: dict[str, Any]) -> str | None:
-    """Read the accepted input parameter, never a task log or an instance name."""
+    """调度器续跑后将启动参数保留在 commandParam.StartParams。"""
     try:
-        parameters = instance.get("globalParams") or "[]"
+        parameters = instance.get("globalParams") or []
         if isinstance(parameters, str):
             parameters = json.loads(parameters)
         if not isinstance(parameters, list) or any(not isinstance(item, dict) for item in parameters):
             raise ValueError
         values = [item.get("value") for item in parameters if item.get("prop") == "input_file"]
-        if not values:
-            return None
-        if len(values) != 1 or not isinstance(values[0], str):
+        if len(values) > 1 or any(not isinstance(value, str) for value in values):
             raise ValueError
-        return values[0]
+        command = instance.get("commandParam") or {}
+        if isinstance(command, str):
+            command = json.loads(command)
+        if not isinstance(command, dict):
+            raise ValueError
+        start = command.get("StartParams") or {}
+        if isinstance(start, str):
+            start = json.loads(start)
+        if not isinstance(start, dict):
+            raise ValueError
+        if "input_file" in start:
+            if not isinstance(start["input_file"], str):
+                raise ValueError
+            values.append(start["input_file"])
+        identities = {value for value in values if value}
+        if len(identities) > 1:
+            raise ValueError
+        return next(iter(identities), None)
     except (TypeError, ValueError) as error:
-        raise DolphinSchedulerError("DolphinScheduler 实例输入身份不完整，未执行删除") from error
+        raise DolphinSchedulerError("DolphinScheduler 实例输入身份无效，未执行操作") from error
 
 
 def validate_input_file(input_file: str) -> str:
@@ -112,7 +131,7 @@ class DolphinSchedulerClient:
             raise DolphinSchedulerError(
                 f"DolphinScheduler 请求失败：{method} {path}",
                 submission_unknown=(
-                    method == "POST" and path.endswith("/executors/start-process-instance")
+                    method == "POST" and path.endswith(("/executors/start-process-instance", "/executors/execute"))
                     and not (
                         isinstance(error, requests.HTTPError)
                         and error.response is not None
@@ -162,6 +181,46 @@ class DolphinSchedulerClient:
                 "startParams": json.dumps({"input_file": input_file}),
             },
         )
+
+    def control(self, kind: str, instance_id: int, input_file: str, action: str,
+                *, expected_run_times: int | None = None) -> dict[str, Any]:
+        if action not in {"stop", "retry"}:
+            raise ValueError(f"未知任务操作：{action}")
+        project = self.project_code()
+        definition = int(self.definition(project, kind)["code"])
+        instance = self.request("GET", f"/projects/{project}/process-instances/{instance_id}")
+        if (
+            not isinstance(instance, dict)
+            or instance.get("id") != instance_id
+            or instance.get("projectCode", project) != project
+            or instance.get("processDefinitionCode") != definition
+            or instance_input_file(instance) != worker_input_file(input_file)
+        ):
+            raise DolphinSchedulerError("DolphinScheduler 实例不属于该任务，未执行操作")
+        state = instance.get("state")
+        if action == "stop":
+            if expected_run_times is not None and instance.get("runTimes") != expected_run_times:
+                raise DolphinSchedulerStateError("终止目标轮次尚未就绪或已变化，请刷新状态")
+            if state in {"READY_STOP", "STOP", "KILL"}:
+                return instance
+            if state not in {"SUBMITTED_SUCCESS", "RUNNING_EXECUTION", "READY_PAUSE", "DELAY_EXECUTION", "SERIAL_WAIT"}:
+                raise DolphinSchedulerStateError("该任务当前不能终止，请刷新状态")
+            execute_type = "STOP"
+        else:
+            if state not in {"FAILURE", "STOP", "KILL", "PAUSE", "BLOCK"}:
+                raise DolphinSchedulerStateError("只能重试已经失败或终止的任务")
+            run_times = instance.get("runTimes")
+            if type(run_times) is not int or run_times < 1:
+                raise DolphinSchedulerError("DolphinScheduler 缺少运行次数字段，未提交重试")
+            if run_times != expected_run_times:
+                raise DolphinSchedulerStateError("调度运行次数已变化，请刷新任务后重试")
+            execute_type = "START_FAILURE_TASK_PROCESS" if state == "FAILURE" else "REPEAT_RUNNING"
+        self.request(
+            "POST",
+            f"/projects/{project}/executors/execute",
+            {"processInstanceId": instance_id, "executeType": execute_type},
+        )
+        return instance
 
     def instances(self, kind: str, page: int = 1) -> list[dict[str, Any]]:
         project = self.project_code()
@@ -278,6 +337,23 @@ class DolphinSchedulerClient:
             "GET", f"/projects/{project}/process-instances/{instance_id}/tasks"
         )
         return result.get("taskList") or []
+
+    def task_history(self, instance_id: int) -> list[dict[str, Any]]:
+        project = self.project_code()
+        tasks = []
+        for page in range(1, 101):
+            result = self.request("GET", f"/projects/{project}/task-instances", {
+                "processInstanceId": instance_id, "pageNo": page, "pageSize": 100,
+            })
+            items = result.get("totalList") or []
+            if any(item.get("processInstanceId") != instance_id for item in items):
+                raise DolphinSchedulerError("调度器历史 Task 归属不一致")
+            tasks.extend(items)
+            if len(tasks) >= int(result.get("total") or 0):
+                return tasks
+            if not items:
+                break
+        raise DolphinSchedulerError("调度器历史 Task 列表不完整")
 
     def log(self, task_id: int, offset: int = 0, limit: int = 1000) -> dict[str, Any]:
         result = self.task_log_detail(task_id, offset, limit)

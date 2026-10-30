@@ -1,6 +1,7 @@
 """Hard deletion with a transient UUID journal and same-mount filesystem staging."""
 
 import json
+import os
 import shutil
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
@@ -10,18 +11,19 @@ from uuid import UUID, uuid4
 
 import requests
 from fastapi import HTTPException
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session
 
 from config import DolphinSchedulerSettings, SoloSettings
 from core.scheduler.client import DolphinSchedulerBusyError, DolphinSchedulerClient, DolphinSchedulerError
+from core.apps.tasks.models import TaskAttempt
 
 from .environment import kernel_directory
 from .models import Project, ProjectVersion
 from .schemas import ProjectEdit
 
 
-ACTIVE_PHASES = ("building", "queued", "running")
+ACTIVE_PHASES = ("building", "queued", "running", "stopping", "retrying")
 _lifecycle_projects: set[UUID] = set()
 _lifecycle_lock = Lock()
 
@@ -352,8 +354,10 @@ def delete_project(project_id: UUID, session: Session, *, delete_files: bool = T
 
 
 def _delete_project(project_id: UUID, session: Session, *, delete_files: bool) -> None:
-    from .models import ProjectDeletion
+    from .models import ProjectDeletion, VersionDeletion
 
+    if session.scalar(select(VersionDeletion.id).where(VersionDeletion.project_id == project_id)):
+        raise HTTPException(409, "项目正在完成后台清理，请稍后重试")
     project = session.scalar(select(Project).where(Project.id == project_id).with_for_update()
                              .execution_options(populate_existing=True))
     job = session.scalar(select(ProjectDeletion).where(ProjectDeletion.id == project_id).with_for_update()
@@ -430,6 +434,7 @@ def _delete_project(project_id: UUID, session: Session, *, delete_files: bool) -
             if any(jupyter_resources(project.id, f"projects/{project.kind}/{project.name}")):
                 raise HTTPException(409, "清理期间启动了项目 Kernel，已恢复项目，请稍后重试")
             job.payload = {**job.payload, "phase": "deleted"}
+            session.execute(delete(TaskAttempt).where(TaskAttempt.run_id.in_([version.id for version in versions])))
             session.delete(project)
             session.commit()  # Cascade removes versions; no permanent archive/tombstone remains.
             deleted = True
@@ -519,3 +524,40 @@ def _delete_project(project_id: UUID, session: Session, *, delete_files: bool) -
     except Exception as error:
         session.rollback()
         raise cleanup_incomplete(project_id, "资源已清理，但清理记录删除未完成，请重试") from error
+
+
+def directory_size(directory: Path) -> int:
+    total = 0
+    for root, _, names in os.walk(directory):
+        for name in names:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                continue
+    return total
+
+
+def version_published(session: Session, project: Project, version: ProjectVersion) -> bool:
+    from core.apps import version_policy as policy
+    from core.apps.artifacts.models import ResearchArtifact
+
+    if session.scalar(select(ResearchArtifact.id).where(
+            ResearchArtifact.origin_version_id == version.id, ResearchArtifact.published_at.is_not(None))) is not None:
+        return True
+    # 旧成果可能没有来源版本，按版本页面同样的接受快照识别。
+    for snapshot in policy.snapshot_values(version.accepted_artifacts).values():
+        if (snapshot.get("origin_project_id") == str(project.id) and snapshot.get("version") == version.package_version
+                and snapshot.get("id")):
+            artifact = session.get(ResearchArtifact, UUID(snapshot["id"]))
+            if artifact is not None and artifact.published_at:
+                return True
+    return False
+
+
+def delete_version(project_id: UUID, version_id: UUID, session: Session) -> dict:
+    from core.apps.tasks.services import task_guard
+
+    from .version_deletion import remove_version
+
+    with project_lifecycle_guard(project_id, session), task_guard(session, version_id):
+        return remove_version(project_id, version_id, session)
