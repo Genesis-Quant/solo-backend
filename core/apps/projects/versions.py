@@ -211,6 +211,10 @@ def submit_version(project_id: UUID, version_id: UUID, body: BuildResult, sessio
     version.status = "queued"
     version.error = ""
     version.finished_at = None
+    attempt = task_service.current_attempt(session, version, kind)
+    attempt.status, attempt.error = version.status, version.error
+    attempt.sync_error = ""
+    attempt.started_at = attempt.finished_at = attempt.synced_at = None
     session.commit()
     try:
         with DolphinSchedulerClient() as client:

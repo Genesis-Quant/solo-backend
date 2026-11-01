@@ -225,8 +225,10 @@ def synchronize(session: Session, record, kind: str, *, force: bool = False, gua
     attempt = current_attempt(session, record, kind)
     if attempt.retry_state == "rejected":
         return attempt
-    if not force and attempt.synced_at and not attempt.sync_error and (
-        attempt.status in TERMINAL or seconds(attempt.synced_at) < 2
+    if (
+        not force and attempt.synced_at and not attempt.sync_error
+        and attempt.status == record.status and attempt.workflow_id == record.workflow_id
+        and (attempt.status in TERMINAL or seconds(attempt.synced_at) < 2)
     ):
         return attempt
     if not record.workflow_id and record.status in {"building", "failed", "stopped", "submit_failed"}:
